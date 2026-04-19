@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -641,13 +642,38 @@ std::string TrimCopy(const std::string& value) {
     return std::string(first, last);
 }
 
+bool TryFileSizeForFingerprint(const std::string& path, std::uint64_t& size) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &data)) {
+        return false;
+    }
+    size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    return true;
+#else
+    struct stat data {};
+    if (stat(path.c_str(), &data) != 0) {
+        return false;
+    }
+    size = static_cast<std::uint64_t>(data.st_size);
+    return true;
+#endif
+}
+
 std::string FileFingerprint(const std::string& path) {
+    static std::unordered_map<std::string, std::string> cache;
     if (path.empty()) {
         return "unknown";
     }
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        return "unknown";
+    const auto cached = cache.find(path);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+
+    std::uint64_t size = 0;
+    if (!TryFileSizeForFingerprint(path, size)) {
+        cache[path] = "unknown";
+        return cache[path];
     }
 
     std::uint64_t hash = 1469598103934665603ull;
@@ -655,20 +681,28 @@ std::string FileFingerprint(const std::string& path) {
         hash ^= static_cast<unsigned char>(c);
         hash *= 1099511628211ull;
     }
-    file.seekg(0, std::ios::end);
-    const auto size = file.tellg();
-    for (char c : std::to_string(static_cast<long long>(size))) {
+    for (char c : std::to_string(size)) {
         hash ^= static_cast<unsigned char>(c);
         hash *= 1099511628211ull;
     }
 
     std::ostringstream out;
     out << "fast-fnv1a64:" << std::hex << std::setw(16) << std::setfill('0') << hash;
-    return out.str();
+    cache[path] = out.str();
+    return cache[path];
 }
 
 std::string SigningStateForPath(const std::string& path) {
-    return path.empty() ? "unknown" : "unverified";
+    static std::unordered_map<std::string, std::string> cache;
+    if (path.empty()) {
+        return "unknown";
+    }
+    const auto cached = cache.find(path);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+    cache[path] = "unverified";
+    return cache[path];
 }
 
 std::string ReadPromptLine(const std::string& prompt) {
@@ -3204,6 +3238,10 @@ private:
         const UiState& ui
     ) {
         const auto& processes = snapshot.processes;
+        for (int row = 4; row <= height - 1; ++row) {
+            printBoxLine(row, col, width, "");
+        }
+
         printBoxLine(4, col, width, "SELECTED PROCESS", Ansi::Cyan);
         if (selected) {
             printBoxLine(5, col, width, field("pid", std::to_string(selected->pid), width));
