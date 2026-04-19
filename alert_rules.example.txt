@@ -1,0 +1,10 @@
+# CliProcster alert rules
+# Format: Name field op value
+# Fields: cpu, mem_mb, threads, pid, ppid, name, path, service, sid
+# Ops: gt, gte, lt, lte, eq, contains
+
+HighCPU cpu gte 50
+LargeMemory mem_mb gt 1024
+SuspiciousName name contains miner
+PowerShellSeen name contains powershell
+ManyThreads threads gt 200

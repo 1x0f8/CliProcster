@@ -1,0 +1,26 @@
+.vs/
+.vscode/
+x64/
+start/
+Win32/
+Debug/
+Release/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+*.ipch
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.log
+*.tlog/
+*.lastbuildstate
+*.recipe
+
+# Runtime/export artifacts
+cliprocster_events.ndjson
+cliprocster.prom
+cliprocster_snapshot.json
+procmon_snapshot.json
