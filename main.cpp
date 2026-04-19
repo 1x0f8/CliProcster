@@ -3899,6 +3899,7 @@ private:
         saveTabCursor(ui);
         ui.activeTab = tab;
         ui.focusPane = FocusPane::ProcessList;
+        ui.pathScroll = 0;
         restoreTabCursor(ui);
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
