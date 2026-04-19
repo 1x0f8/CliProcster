@@ -25,6 +25,12 @@
     <RootNamespace>CliProcster</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
+  <PropertyGroup Condition="!Exists('$(VCTargetsPath)\Microsoft.Cpp.Default.props') and Exists('C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\Microsoft.Cpp.Default.props')">
+    <VCTargetsPath>C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\</VCTargetsPath>
+  </PropertyGroup>
+  <PropertyGroup Condition="!Exists('$(VCTargetsPath)\Microsoft.Cpp.Default.props') and Exists('C:\Program Files\Microsoft Visual Studio\18\Insiders\MSBuild\Microsoft\VC\v170\Microsoft.Cpp.Default.props')">
+    <VCTargetsPath>C:\Program Files\Microsoft Visual Studio\18\Insiders\MSBuild\Microsoft\VC\v170\</VCTargetsPath>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
