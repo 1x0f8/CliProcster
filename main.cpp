@@ -1,6 +1,8 @@
 #define NOMINMAX
 #include <cstdint>
 #ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
@@ -8,9 +10,12 @@
 #include <winsvc.h>
 #include <conio.h>
 #else
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
 #include <termios.h>
@@ -21,6 +26,7 @@ using SIZE_T = std::size_t;
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <chrono>
 #include <cerrno>
@@ -30,6 +36,7 @@ using SIZE_T = std::size_t;
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -40,6 +47,7 @@ using SIZE_T = std::size_t;
 #ifdef _WIN32
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Ws2_32.lib")
 #endif
 
 namespace {
@@ -141,6 +149,7 @@ struct ProcessInfo {
     AccessField path;
     AccessField sid;
     std::string service;
+    std::string commandLine;
 };
 
 struct ProcessGroup {
@@ -174,6 +183,7 @@ struct ProcessDto {
     std::string path;
     std::string sid;
     std::string service;
+    std::string commandLine;
     double cpu = 0.0;
     SIZE_T workingSet = 0;
     DWORD threads = 0;
@@ -202,6 +212,9 @@ struct AppOptions {
     std::string rulesPath;
     std::string siemEventsPath;
     std::string prometheusPath;
+    bool httpApi = false;
+    std::string httpBind = "127.0.0.1";
+    int httpPort = 8765;
 };
 
 struct HuntState {
@@ -558,7 +571,7 @@ bool MatchesFilter(const ProcessInfo& process, const AppOptions& options) {
         return true;
     }
 
-    const std::string haystack = process.name + " " + process.path.value + " " + process.sid.value + " " +
+    const std::string haystack = process.name + " " + process.commandLine + " " + process.path.value + " " + process.sid.value + " " +
         process.service + " " + std::to_string(process.pid);
     return MatchesQuery(haystack, options.filter);
 }
@@ -662,6 +675,7 @@ public:
                 info.threads = entry.cntThreads;
                 info.name = WideToUtf8(entry.szExeFile);
                 info.path = queryImagePath(info.pid);
+                info.commandLine = info.path.value.empty() ? info.name : info.path.value;
                 info.sid = querySid(info.pid);
                 info.workingSet = queryWorkingSet(info.pid);
 
@@ -1042,8 +1056,19 @@ private:
 
         readStatus(info, base + "/status");
         info.path = readLinkField(base + "/exe");
+        info.commandLine = readCommandLine(base + "/cmdline");
         info.workingSet = readWorkingSet(base + "/statm");
         return true;
+    }
+
+    static std::string readCommandLine(const std::string& path) {
+        std::string value = readFile(path);
+        for (char& c : value) {
+            if (c == '\0') {
+                c = ' ';
+            }
+        }
+        return TrimCopy(value);
     }
 
     static void readStatus(ProcessInfo& info, const std::string& path) {
@@ -1310,6 +1335,13 @@ public:
     }
 
     void evaluate(const ProcessSnapshot& snapshot, UiState& ui, IntegrationHub& hub) {
+        std::unordered_map<DWORD, int> childCounts;
+        for (const auto& process : snapshot.processes) {
+            if (process.pid != process.parentPid) {
+                childCounts[process.parentPid] += 1;
+            }
+        }
+
         for (auto& item : cooldown_) {
             if (item.second > 0) {
                 item.second -= 1;
@@ -1319,7 +1351,8 @@ public:
         int fired = 0;
         for (const auto& process : snapshot.processes) {
             for (const auto& rule : rules_) {
-                if (!matches(rule, process)) {
+                const auto childCount = childCounts.find(process.pid);
+                if (!matches(rule, process, childCount == childCounts.end() ? 0 : childCount->second)) {
                     continue;
                 }
                 const std::string key = rule.name + ":" + std::to_string(process.pid);
@@ -1345,43 +1378,50 @@ private:
         const bool numeric = rule.op == "gt" || rule.op == "gte" || rule.op == "lt" || rule.op == "lte" || rule.op == "eq";
         const bool text = rule.op == "contains" || rule.op == "eq";
         const bool knownField = rule.field == "cpu" || rule.field == "mem_mb" || rule.field == "threads" || rule.field == "pid" || rule.field == "ppid" ||
-            rule.field == "name" || rule.field == "path" || rule.field == "service" || rule.field == "sid";
+            rule.field == "child_count" || rule.field == "name" || rule.field == "path" || rule.field == "command_line" || rule.field == "cmdline" ||
+            rule.field == "service" || rule.field == "sid" || rule.field == "signer" || rule.field == "hash";
         return knownField && (numeric || text);
     }
 
-    static std::string fieldText(const AlertRule& rule, const ProcessInfo& process) {
+    static std::string fieldText(const AlertRule& rule, const ProcessInfo& process, int childCount) {
         if (rule.field == "name") return process.name;
         if (rule.field == "path") return process.path.value;
+        if (rule.field == "command_line" || rule.field == "cmdline") return process.commandLine;
         if (rule.field == "service") return process.service;
         if (rule.field == "sid") return process.sid.value;
         if (rule.field == "pid") return std::to_string(process.pid);
         if (rule.field == "ppid") return std::to_string(process.parentPid);
         if (rule.field == "threads") return std::to_string(process.threads);
+        if (rule.field == "child_count") return std::to_string(childCount);
         if (rule.field == "cpu") return std::to_string(process.cpu);
         if (rule.field == "mem_mb") return MemoryMb(process.workingSet);
+        if (rule.field == "signer") return "unknown";
+        if (rule.field == "hash") return "unknown";
         return {};
     }
 
-    static double fieldNumber(const AlertRule& rule, const ProcessInfo& process) {
+    static double fieldNumber(const AlertRule& rule, const ProcessInfo& process, int childCount) {
         if (rule.field == "cpu") return process.cpu;
         if (rule.field == "mem_mb") return static_cast<double>(process.workingSet) / 1024.0 / 1024.0;
         if (rule.field == "threads") return static_cast<double>(process.threads);
         if (rule.field == "pid") return static_cast<double>(process.pid);
         if (rule.field == "ppid") return static_cast<double>(process.parentPid);
-        return std::strtod(fieldText(rule, process).c_str(), nullptr);
+        if (rule.field == "child_count") return static_cast<double>(childCount);
+        return std::strtod(fieldText(rule, process, childCount).c_str(), nullptr);
     }
 
-    static bool matches(const AlertRule& rule, const ProcessInfo& process) {
+    static bool matches(const AlertRule& rule, const ProcessInfo& process, int childCount) {
         if (rule.op == "contains") {
-            return ContainsText(fieldText(rule, process), rule.value);
+            return ContainsText(fieldText(rule, process, childCount), rule.value);
         }
         if (rule.op == "eq") {
-            if (rule.field == "name" || rule.field == "path" || rule.field == "service" || rule.field == "sid") {
-                return ToLower(fieldText(rule, process)) == ToLower(rule.value);
+            if (rule.field == "name" || rule.field == "path" || rule.field == "command_line" || rule.field == "cmdline" ||
+                rule.field == "service" || rule.field == "sid" || rule.field == "signer" || rule.field == "hash") {
+                return ToLower(fieldText(rule, process, childCount)) == ToLower(rule.value);
             }
-            return fieldNumber(rule, process) == rule.number;
+            return fieldNumber(rule, process, childCount) == rule.number;
         }
-        const double value = fieldNumber(rule, process);
+        const double value = fieldNumber(rule, process, childCount);
         if (rule.op == "gt") return value > rule.number;
         if (rule.op == "gte") return value >= rule.number;
         if (rule.op == "lt") return value < rule.number;
@@ -1416,15 +1456,19 @@ public:
         }
     }
 
-    void writePrometheus(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const std::string& path) {
-        if (path.empty()) {
-            return;
+    static std::string eventsNdjson(const IntegrationHub& hub) {
+        std::ostringstream out;
+        for (const auto& event : hub.events()) {
+            out << "{\"ts\":" << event.timestampMs
+                << ",\"seq\":" << event.sequence
+                << ",\"type\":\"" << JsonEscape(EventTypeName(event.type)) << "\""
+                << ",\"pid\":" << event.pid
+                << ",\"message\":\"" << JsonEscape(event.text) << "\"}\n";
         }
-        std::ofstream file(path, std::ios::trunc);
-        if (!file) {
-            return;
-        }
+        return out.str();
+    }
 
+    static std::string prometheusText(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub) {
         SIZE_T memory = 0;
         double cpu = 0.0;
         int kernel = 0;
@@ -1441,20 +1485,33 @@ public:
             huntAlerts += event.type == EventType::HuntAlertTriggered ? 1 : 0;
         }
 
-        file << "# HELP cliprocster_processes Number of visible collected processes\n"
-             << "# TYPE cliprocster_processes gauge\n"
-             << "cliprocster_processes " << snapshot.processes.size() << "\n"
-             << "cliprocster_kernel_processes " << kernel << "\n"
-             << "cliprocster_process_cpu_percent_sum " << std::fixed << std::setprecision(2) << cpu << "\n"
-             << "cliprocster_process_working_set_bytes_sum " << memory << "\n"
-             << "cliprocster_services " << snapshot.services.size() << "\n"
-             << "cliprocster_kernel_drivers " << snapshot.drivers.size() << "\n"
-             << "cliprocster_registry_run_entries " << snapshot.registryKeys.size() << "\n"
-             << "cliprocster_hunt_active " << (ui.hunt.active ? 1 : 0) << "\n"
-             << "cliprocster_hunt_alert " << (!ui.hunt.alert.empty() ? 1 : 0) << "\n"
-             << "cliprocster_rules_loaded " << rules.rules().size() << "\n"
-             << "cliprocster_rule_alerts_buffered_total " << ruleAlerts << "\n"
-             << "cliprocster_hunt_alerts_buffered_total " << huntAlerts << "\n";
+        std::ostringstream out;
+        out << "# HELP cliprocster_processes Number of visible collected processes\n"
+            << "# TYPE cliprocster_processes gauge\n"
+            << "cliprocster_processes " << snapshot.processes.size() << "\n"
+            << "cliprocster_kernel_processes " << kernel << "\n"
+            << "cliprocster_process_cpu_percent_sum " << std::fixed << std::setprecision(2) << cpu << "\n"
+            << "cliprocster_process_working_set_bytes_sum " << memory << "\n"
+            << "cliprocster_services " << snapshot.services.size() << "\n"
+            << "cliprocster_kernel_drivers " << snapshot.drivers.size() << "\n"
+            << "cliprocster_startup_entries " << snapshot.registryKeys.size() << "\n"
+            << "cliprocster_hunt_active " << (ui.hunt.active ? 1 : 0) << "\n"
+            << "cliprocster_hunt_alert " << (!ui.hunt.alert.empty() ? 1 : 0) << "\n"
+            << "cliprocster_rules_loaded " << rules.rules().size() << "\n"
+            << "cliprocster_rule_alerts_buffered_total " << ruleAlerts << "\n"
+            << "cliprocster_hunt_alerts_buffered_total " << huntAlerts << "\n";
+        return out.str();
+    }
+
+    void writePrometheus(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const std::string& path) {
+        if (path.empty()) {
+            return;
+        }
+        std::ofstream file(path, std::ios::trunc);
+        if (!file) {
+            return;
+        }
+        file << prometheusText(snapshot, ui, rules, hub);
     }
 
 private:
@@ -1493,6 +1550,7 @@ public:
                  << ", \"path\": \"" << escape(process.path) << "\""
                  << ", \"sid\": \"" << escape(process.sid) << "\""
                  << ", \"service\": \"" << escape(process.service) << "\""
+                 << ", \"commandLine\": \"" << escape(process.commandLine) << "\""
                  << ", \"cpu\": " << std::fixed << std::setprecision(2) << process.cpu
                  << ", \"workingSet\": " << process.workingSet
                  << ", \"threads\": " << process.threads
@@ -1551,6 +1609,7 @@ public:
             item.path = process.path.value;
             item.sid = process.sid.value;
             item.service = process.service;
+            item.commandLine = process.commandLine;
             item.cpu = process.cpu;
             item.workingSet = process.workingSet;
             item.threads = process.threads;
@@ -1558,6 +1617,227 @@ public:
         }
         return dto;
     }
+};
+
+std::string SnapshotJson(const SnapshotDto& snapshot) {
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"view\": \"" << JsonEscape(snapshot.view) << "\",\n";
+    out << "  \"filter\": \"" << JsonEscape(snapshot.filter) << "\",\n";
+    out << "  \"selectedPid\": " << snapshot.selectedPid << ",\n";
+    out << "  \"hunt\": { \"active\": " << (snapshot.huntActive ? "true" : "false")
+        << ", \"pid\": " << snapshot.huntPid
+        << ", \"alert\": \"" << JsonEscape(snapshot.huntAlert) << "\" },\n";
+    out << "  \"processes\": [\n";
+    for (std::size_t i = 0; i < snapshot.processes.size(); ++i) {
+        const auto& process = snapshot.processes[i];
+        out << "    {"
+            << "\"pid\": " << process.pid
+            << ", \"parentPid\": " << process.parentPid
+            << ", \"name\": \"" << JsonEscape(process.name) << "\""
+            << ", \"path\": \"" << JsonEscape(process.path) << "\""
+            << ", \"sid\": \"" << JsonEscape(process.sid) << "\""
+            << ", \"service\": \"" << JsonEscape(process.service) << "\""
+            << ", \"commandLine\": \"" << JsonEscape(process.commandLine) << "\""
+            << ", \"cpu\": " << std::fixed << std::setprecision(2) << process.cpu
+            << ", \"workingSet\": " << process.workingSet
+            << ", \"threads\": " << process.threads
+            << "}";
+        out << (i + 1 == snapshot.processes.size() ? "\n" : ",\n");
+    }
+    out << "  ]\n";
+    out << "}\n";
+    return out.str();
+}
+
+struct ApiState {
+    ProcessSnapshot snapshot;
+    UiState ui;
+    AppOptions options;
+    std::string events;
+    std::string metrics;
+    bool ready = false;
+};
+
+class LocalHttpApi {
+public:
+    ~LocalHttpApi() {
+        stop();
+    }
+
+    bool start(const std::string& bindAddress, int port, std::string& error) {
+        if (running_) {
+            return true;
+        }
+#ifdef _WIN32
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            error = "WSAStartup failed";
+            return false;
+        }
+        winsockStarted_ = true;
+#endif
+        bindAddress_ = bindAddress;
+        port_ = port;
+        running_ = true;
+        worker_ = std::thread([this]() { serve(); });
+        return true;
+    }
+
+    void stop() {
+        if (!running_) {
+            return;
+        }
+        running_ = false;
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+#ifdef _WIN32
+        if (winsockStarted_) {
+            WSACleanup();
+            winsockStarted_ = false;
+        }
+#endif
+    }
+
+    void publish(const ProcessSnapshot& snapshot, const AppOptions& options, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_.snapshot = snapshot;
+        state_.options = options;
+        state_.ui = ui;
+        state_.events = IntegrationExporter::eventsNdjson(hub);
+        state_.metrics = IntegrationExporter::prometheusText(snapshot, ui, rules, hub);
+        state_.ready = true;
+    }
+
+private:
+#ifdef _WIN32
+    using Socket = SOCKET;
+    static constexpr Socket InvalidSocket = INVALID_SOCKET;
+#else
+    using Socket = int;
+    static constexpr Socket InvalidSocket = -1;
+#endif
+
+    void serve() {
+        Socket server = createServerSocket();
+        if (server == InvalidSocket) {
+            running_ = false;
+            return;
+        }
+
+        while (running_) {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(server, &readSet);
+            timeval timeout{ 0, 200000 };
+            const int ready = select(static_cast<int>(server + 1), &readSet, nullptr, nullptr, &timeout);
+            if (ready <= 0 || !FD_ISSET(server, &readSet)) {
+                continue;
+            }
+
+            Socket client = accept(server, nullptr, nullptr);
+            if (client == InvalidSocket) {
+                continue;
+            }
+            handleClient(client);
+            closeSocket(client);
+        }
+        closeSocket(server);
+    }
+
+    Socket createServerSocket() const {
+        Socket server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (server == InvalidSocket) {
+            return InvalidSocket;
+        }
+
+        int enabled = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(static_cast<unsigned short>(port_));
+        if (inet_pton(AF_INET, bindAddress_.c_str(), &address.sin_addr) != 1) {
+            closeSocket(server);
+            return InvalidSocket;
+        }
+
+        if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 || listen(server, 8) != 0) {
+            closeSocket(server);
+            return InvalidSocket;
+        }
+        return server;
+    }
+
+    void handleClient(Socket client) {
+        char buffer[1024]{};
+        const int received = recv(client, buffer, static_cast<int>(sizeof(buffer) - 1), 0);
+        if (received <= 0) {
+            return;
+        }
+
+        std::istringstream request(std::string(buffer, static_cast<std::size_t>(received)));
+        std::string method;
+        std::string target;
+        request >> method >> target;
+        if (method != "GET") {
+            sendResponse(client, 405, "text/plain; charset=utf-8", "method not allowed\n");
+            return;
+        }
+
+        ApiState current;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            current = state_;
+        }
+
+        if (!current.ready) {
+            sendResponse(client, 503, "text/plain; charset=utf-8", "snapshot not ready\n");
+            return;
+        }
+        if (target == "/snapshot") {
+            sendResponse(client, 200, "application/json; charset=utf-8", SnapshotJson(SnapshotDtoFactory::make(current.snapshot, current.options, current.ui)));
+        } else if (target == "/events") {
+            sendResponse(client, 200, "application/x-ndjson; charset=utf-8", current.events);
+        } else if (target == "/metrics") {
+            sendResponse(client, 200, "text/plain; version=0.0.4; charset=utf-8", current.metrics);
+        } else {
+            sendResponse(client, 404, "text/plain; charset=utf-8", "not found\n");
+        }
+    }
+
+    static void sendResponse(Socket client, int status, const std::string& contentType, const std::string& body) {
+        const std::string reason = status == 200 ? "OK" : (status == 404 ? "Not Found" : (status == 405 ? "Method Not Allowed" : "Service Unavailable"));
+        std::ostringstream response;
+        response << "HTTP/1.1 " << status << " " << reason << "\r\n"
+                 << "Content-Type: " << contentType << "\r\n"
+                 << "Content-Length: " << body.size() << "\r\n"
+                 << "Connection: close\r\n"
+                 << "Access-Control-Allow-Origin: http://127.0.0.1\r\n"
+                 << "\r\n"
+                 << body;
+        const std::string text = response.str();
+        send(client, text.c_str(), static_cast<int>(text.size()), 0);
+    }
+
+    static void closeSocket(Socket socket) {
+#ifdef _WIN32
+        closesocket(socket);
+#else
+        close(socket);
+#endif
+    }
+
+    std::atomic<bool> running_{ false };
+    std::thread worker_;
+    std::mutex mutex_;
+    ApiState state_;
+    std::string bindAddress_ = "127.0.0.1";
+    int port_ = 8765;
+#ifdef _WIN32
+    bool winsockStarted_ = false;
+#endif
 };
 
 class ConsoleWindow {
@@ -3451,6 +3731,7 @@ public:
             return 0;
         }
         loadRulesIfConfigured();
+        startApiIfConfigured();
 
         if (options_.once) {
             std::cout << "\x1b[2J";
@@ -3461,6 +3742,7 @@ public:
             alertRules_.evaluate(snapshot, ui_, hub_);
             integrations_.writeEvents(hub_, options_.siemEventsPath);
             integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath);
+            api_.publish(snapshot, options_, ui_, alertRules_, hub_);
             const auto rows = renderer_.rowsForActions(snapshot.processes, options_, ui_);
             if (ui_.selectedPid == 0 && !rows.empty()) {
                 ui_.selectedIndex = 0;
@@ -3501,6 +3783,7 @@ public:
                 integrations_.writeEvents(hub_, options_.siemEventsPath);
                 integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath);
             }
+            api_.publish(snapshot, options_, ui_, alertRules_, hub_);
             renderer_.render(snapshot, options_, ui_);
             if (!modalOpen) {
                 tickNotification();
@@ -3558,6 +3841,18 @@ private:
         }
     }
 
+    void startApiIfConfigured() {
+        if (!options_.httpApi || options_.once) {
+            return;
+        }
+        std::string error;
+        if (api_.start(options_.httpBind, options_.httpPort, error)) {
+            ui_.notify(NotificationKind::Success, "HTTP API http://" + options_.httpBind + ":" + std::to_string(options_.httpPort));
+        } else {
+            ui_.notify(NotificationKind::Error, "HTTP API failed: " + error, 80);
+        }
+    }
+
     static SortMode parseSort(std::string value) {
         value = ToLower(value);
         if (value == "mem" || value == "memory") {
@@ -3612,8 +3907,12 @@ private:
             << "  --include-kernel | --no-kernel\n"
             << "  --export-json FILE         export snapshot JSON and exit\n"
             << "  --rules FILE               load alert rules: Name field op value\n"
+            << "                             fields include child_count and command_line\n"
             << "  --siem-events FILE         append NDJSON events for SIEM ingestion\n"
             << "  --prometheus-file FILE     write Prometheus textfile metrics\n"
+            << "  --http-api                 serve /snapshot, /events, /metrics locally\n"
+            << "  --http-bind ADDRESS        API bind address, default 127.0.0.1\n"
+            << "  --http-port PORT           API port, default 8765\n"
             << "\n"
             << "keys:\n";
         for (const auto& command : CommandRegistry()) {
@@ -3655,6 +3954,14 @@ private:
                 options_.siemEventsPath = argv[++i];
             } else if (arg == "--prometheus-file" && i + 1 < argc) {
                 options_.prometheusPath = argv[++i];
+            } else if (arg == "--http-api") {
+                options_.httpApi = true;
+            } else if (arg == "--http-bind" && i + 1 < argc) {
+                options_.httpBind = argv[++i];
+                options_.httpApi = true;
+            } else if (arg == "--http-port" && i + 1 < argc) {
+                options_.httpPort = std::max(1, std::min(65535, parseInt(argv[++i], options_.httpPort)));
+                options_.httpApi = true;
             } else if (arg == "--include-kernel") {
                 options_.includeKernel = true;
             } else if (arg == "--no-kernel") {
@@ -3714,6 +4021,7 @@ private:
     IntegrationHub hub_;
     AlertRuleService alertRules_;
     IntegrationExporter integrations_;
+    LocalHttpApi api_;
     HuntService hunt_;
     CommandDispatcher dispatcher_{ renderer_, exporter_, hub_ };
 };
