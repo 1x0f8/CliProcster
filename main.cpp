@@ -914,7 +914,7 @@ private:
         return total;
     }
 
-    static bool readProcess(ProcessInfo& info, unsigned long long systemTicks, std::map<DWORD, ProcessTimes>& currentTimes) {
+    bool readProcess(ProcessInfo& info, unsigned long long systemTicks, std::map<DWORD, ProcessTimes>& currentTimes) {
         const std::string base = "/proc/" + std::to_string(info.pid);
         const std::string stat = readFile(base + "/stat");
         const auto open = stat.find('(');
@@ -1533,18 +1533,25 @@ public:
             if (next != '[' && next != 'O') {
                 return Command::Back;
             }
-            std::string sequence(1, static_cast<char>(next));
-            while (hasKey() && sequence.size() < 12) {
-                const int part = readKey();
-                if (part == 0) {
-                    break;
-                }
-                sequence.push_back(static_cast<char>(part));
-                if ((part >= 'A' && part <= 'Z') || part == '~') {
-                    break;
-                }
+            const int code = readKey();
+            if (code >= '0' && code <= '9') {
+                const int final = readKey();
+                if (code == '1' && final == '~') return Command::JumpTop;
+                if (code == '4' && final == '~') return Command::JumpBottom;
+                if (code == '5' && final == '~') return Command::PageUp;
+                if (code == '6' && final == '~') return Command::PageDown;
+                return Command::None;
             }
-            return commandFromEscape(sequence);
+            switch (code) {
+            case 'A': return Command::MoveUp;
+            case 'B': return Command::MoveDown;
+            case 'C': return Command::ScrollPathRight;
+            case 'D': return Command::ScrollPathLeft;
+            case 'H': return Command::JumpTop;
+            case 'F': return Command::JumpBottom;
+            case 'P': return Command::ToggleHelp;
+            default: return Command::None;
+            }
         }
 #endif
 
@@ -1614,31 +1621,6 @@ private:
         unsigned char c = 0;
         return read(STDIN_FILENO, &c, 1) == 1 ? c : 0;
 #endif
-    }
-
-    static Command commandFromEscape(const std::string& sequence) {
-        if (sequence.empty()) {
-            return Command::None;
-        }
-
-        const char final = sequence.back();
-        switch (final) {
-        case 'A': return Command::MoveUp;
-        case 'B': return Command::MoveDown;
-        case 'C': return Command::ScrollPathRight;
-        case 'D': return Command::ScrollPathLeft;
-        case 'H': return Command::JumpTop;
-        case 'F': return Command::JumpBottom;
-        case 'P': return Command::ToggleHelp;
-        case '~':
-            if (sequence.find("[5") == 0) return Command::PageUp;
-            if (sequence.find("[6") == 0) return Command::PageDown;
-            if (sequence.find("[1") == 0 || sequence.find("[7") == 0) return Command::JumpTop;
-            if (sequence.find("[4") == 0 || sequence.find("[8") == 0) return Command::JumpBottom;
-            return Command::None;
-        default:
-            return Command::None;
-        }
     }
 
 #ifndef _WIN32
