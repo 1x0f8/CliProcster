@@ -296,6 +296,15 @@ struct UiState {
     int selectedIndex = 0;
     DWORD selectedPid = 0;
     bool selectionActive = true;
+    int processSelectedIndex = 0;
+    int processScroll = 0;
+    int startupSelectedIndex = 0;
+    int startupScroll = 0;
+    int driverSelectedIndex = 0;
+    int driverScroll = 0;
+    AppTab selectedSystemTab = AppTab::Registry;
+    std::string selectedSystemKey;
+    bool systemSelectionActive = false;
     bool sortOrderPinned = false;
     std::vector<DWORD> heldRowOrder;
     AppTab activeTab = AppTab::Processes;
@@ -3086,8 +3095,11 @@ private:
             }
             const auto& entry = entries[static_cast<std::size_t>(index)];
             const bool cursor = index == ui.selectedIndex;
+            const bool selected = ui.systemSelectionActive &&
+                ui.selectedSystemTab == ui.activeTab &&
+                ui.selectedSystemKey == entry.type + ":" + entry.name;
             const std::string line = entry.name + "  " + entry.detail;
-            printBoxLine(row, 1, layout.width, line, cursor ? Ansi::FocusBg : Ansi::Reset);
+            printBoxLine(row, 1, layout.width, line, cursor ? Ansi::FocusBg : (selected ? Ansi::Orange : Ansi::Reset));
         }
 
         std::ostringstream status;
@@ -3543,7 +3555,11 @@ public:
             activateFocusedItem(ui, snapshot, options);
             break;
         case Command::Deselect:
-            deselect(ui);
+            if (ui.activeTab == AppTab::Processes) {
+                deselect(ui);
+            } else {
+                deselectSystem(ui);
+            }
             break;
         case Command::Back:
             handleBack(ui);
@@ -3566,20 +3582,26 @@ public:
         case Command::CycleView:
             clearLiveSortHold(ui);
             options.viewMode = nextViewMode(options.viewMode);
-            preserveSelection(ui, snapshot, options);
+            if (ui.activeTab == AppTab::Processes) {
+                preserveSelection(ui, snapshot, options);
+            }
             hub_.publish(EventType::ViewChanged, ui.selectedPid, "view: " + ViewName(options.viewMode));
             ui.notify(NotificationKind::Info, "view changed to " + ViewName(options.viewMode));
             break;
         case Command::CycleSort:
             clearLiveSortHold(ui);
             options.sortMode = nextSortMode(options.sortMode);
-            preserveSelection(ui, snapshot, options);
+            if (ui.activeTab == AppTab::Processes) {
+                preserveSelection(ui, snapshot, options);
+            }
             ui.notify(NotificationKind::Info, "sort changed to " + SortName(options.sortMode));
             break;
         case Command::PromptFilter:
             promptFilter(options, ui);
             if (ui.activeTab == AppTab::Processes) {
                 preserveSelection(ui, snapshot, options);
+            } else {
+                saveTabCursor(ui);
             }
             hub_.publish(EventType::FilterChanged, ui.selectedPid, "filter: " + options.filter);
             break;
@@ -3595,6 +3617,9 @@ public:
             } else {
                 ui.scroll = 0;
                 ui.selectedIndex = 0;
+                ui.systemSelectionActive = false;
+                ui.selectedSystemKey.clear();
+                saveTabCursor(ui);
             }
             ui.notify(NotificationKind::Info, "filter/subtree cleared");
             break;
@@ -3687,16 +3712,48 @@ private:
         return static_cast<int>(renderer_.systemEntriesForActions(snapshot, options, tab).size());
     }
 
+    static void saveTabCursor(UiState& ui) {
+        switch (ui.activeTab) {
+        case AppTab::Processes:
+            ui.processSelectedIndex = ui.selectedIndex;
+            ui.processScroll = ui.scroll;
+            break;
+        case AppTab::Registry:
+            ui.startupSelectedIndex = ui.selectedIndex;
+            ui.startupScroll = ui.scroll;
+            break;
+        case AppTab::Drivers:
+            ui.driverSelectedIndex = ui.selectedIndex;
+            ui.driverScroll = ui.scroll;
+            break;
+        }
+    }
+
+    static void restoreTabCursor(UiState& ui) {
+        switch (ui.activeTab) {
+        case AppTab::Processes:
+            ui.selectedIndex = ui.processSelectedIndex;
+            ui.scroll = ui.processScroll;
+            break;
+        case AppTab::Registry:
+            ui.selectedIndex = ui.startupSelectedIndex;
+            ui.scroll = ui.startupScroll;
+            break;
+        case AppTab::Drivers:
+            ui.selectedIndex = ui.driverSelectedIndex;
+            ui.scroll = ui.driverScroll;
+            break;
+        }
+    }
+
     static void switchTab(UiState& ui, AppTab tab) {
+        saveTabCursor(ui);
         ui.activeTab = tab;
         ui.focusPane = FocusPane::ProcessList;
-        ui.scroll = 0;
-        ui.selectedIndex = 0;
+        restoreTabCursor(ui);
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
         if (tab != AppTab::Processes) {
-            ui.selectionActive = false;
-            ui.selectedPid = 0;
             clearLiveSortHold(ui);
         }
         ui.notify(NotificationKind::Info, "tab: " + TabName(tab));
@@ -3854,6 +3911,14 @@ private:
             ui.notify(NotificationKind::Info, "back to process list");
             return;
         }
+        if (ui.activeTab != AppTab::Processes) {
+            if (ui.systemSelectionActive && ui.selectedSystemTab == ui.activeTab) {
+                deselectSystem(ui);
+                return;
+            }
+            ui.notify(NotificationKind::Info, "nothing selected in " + TabName(ui.activeTab));
+            return;
+        }
         if (ui.selectionActive) {
             deselect(ui);
             return;
@@ -3982,6 +4047,24 @@ private:
     }
 
     void activateFocusedItem(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
+        if (ui.activeTab != AppTab::Processes) {
+            const auto entries = renderer_.systemEntriesForActions(snapshot, options, ui.activeTab);
+            if (entries.empty()) {
+                ui.systemSelectionActive = false;
+                ui.notify(NotificationKind::Warning, "nothing in " + TabName(ui.activeTab) + " tab to select");
+                return;
+            }
+
+            ui.selectedIndex = std::max(0, std::min(ui.selectedIndex, static_cast<int>(entries.size()) - 1));
+            const auto& entry = entries[static_cast<std::size_t>(ui.selectedIndex)];
+            ui.selectedSystemTab = ui.activeTab;
+            ui.selectedSystemKey = entry.type + ":" + entry.name;
+            ui.systemSelectionActive = true;
+            saveTabCursor(ui);
+            ui.notify(NotificationKind::Success, "selected " + TabName(ui.activeTab) + ": " + entry.name);
+            return;
+        }
+
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
                 const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
@@ -4036,6 +4119,12 @@ private:
         ui.focusPane = FocusPane::ProcessList;
         clearLiveSortHold(ui);
         ui.notify(NotificationKind::Info, "selection cleared");
+    }
+
+    static void deselectSystem(UiState& ui) {
+        ui.systemSelectionActive = false;
+        ui.selectedSystemKey.clear();
+        ui.notify(NotificationKind::Info, TabName(ui.activeTab) + " selection cleared");
     }
 
     static void promptFilter(AppOptions& options, UiState& ui) {
