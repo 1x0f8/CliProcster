@@ -1,0 +1,8 @@
+{
+  "rules": [
+    { "name": "JsonHighCPU", "field": "cpu", "op": "gte", "value": "50" },
+    { "name": "JsonManyChildren", "field": "child_count", "op": "gte", "value": "10" },
+    { "name": "JsonEncodedCommand", "field": "command_line", "op": "contains", "value": "encodedcommand" }
+  ]
+}
+

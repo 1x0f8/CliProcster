@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(CliProcster LANGUAGES CXX)
 
-add_executable(CliProcster main.cpp)
+add_executable(CliProcster main.cpp src/observability_backends.cpp)
 target_compile_features(CliProcster PRIVATE cxx_std_17)
 
 if(WIN32)

@@ -133,16 +133,19 @@ Rules are loaded with:
 x64\Debug\CliProcster.exe --rules alert_rules.example.txt
 ```
 
-Rule format:
+Rule formats:
 
 ```text
 Name field op value
+alert_rules.example.json
+alert_rules.example.toml
+alert_rules.example.yaml
 ```
 
 Supported fields:
 
 ```text
-cpu, mem_mb, threads, pid, ppid, name, path, service, sid
+cpu, mem_mb, threads, child_count, pid, ppid, name, path, command_line, service, sid, signer, hash
 ```
 
 Supported operators:
@@ -158,6 +161,30 @@ HighCPU cpu gte 50
 LargeMemory mem_mb gt 1024
 PowerShellSeen name contains powershell
 ManyThreads threads gt 200
+ManyChildren child_count gte 10
+EncodedCommand command_line contains encodedcommand
+```
+
+## Local HTTP API
+
+Serve local integration endpoints:
+
+```powershell
+x64\Debug\CliProcster.exe --http-api --http-port 8765
+```
+
+Endpoints:
+
+```text
+/snapshot
+/events
+/metrics
+/rules
+/history/processes
+/history/services
+/history/startup
+/history/drivers
+/health
 ```
 
 ## SIEM Export
@@ -193,23 +220,29 @@ cliprocster_process_cpu_percent_sum
 cliprocster_process_working_set_bytes_sum
 cliprocster_services
 cliprocster_kernel_drivers
-cliprocster_registry_run_entries
+cliprocster_startup_entries
 cliprocster_hunt_active
 cliprocster_hunt_alert
 cliprocster_rules_loaded
 cliprocster_rule_alerts_buffered_total
 cliprocster_hunt_alerts_buffered_total
+cliprocster_history_process_events
+cliprocster_history_service_events
+cliprocster_history_startup_events
+cliprocster_history_driver_events
 ```
 
 For a normal Prometheus scrape, use the textfile collector pattern or have a small local exporter serve this file.
 
 ## Architecture
 
-Main pieces in `main.cpp`:
+Main pieces:
 
 ```text
+src/observability_backends.cpp  Trace backend detection and fallback reporting
 ProcessCollector      WinAPI collection on Windows, /proc collection on Linux
 ProcessRepository     Snapshot cache and pause/live behavior
+HistoryTracker        process/service/startup/driver diff history
 UiState               Cursor, selection, tabs, panes, hunt state
 Renderer              Deterministic ANSI TUI rendering
 InputController       Key-to-command mapping

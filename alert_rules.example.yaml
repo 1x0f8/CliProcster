@@ -1,0 +1,14 @@
+rules:
+  - name: YamlHighCPU
+    field: cpu
+    op: gte
+    value: "50"
+  - name: YamlManyChildren
+    field: child_count
+    op: gte
+    value: "10"
+  - name: YamlEncodedCommand
+    field: command_line
+    op: contains
+    value: encodedcommand
+

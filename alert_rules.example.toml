@@ -1,0 +1,18 @@
+[[rules]]
+name = "TomlHighCPU"
+field = "cpu"
+op = "gte"
+value = "50"
+
+[[rules]]
+name = "TomlManyChildren"
+field = "child_count"
+op = "gte"
+value = "10"
+
+[[rules]]
+name = "TomlEncodedCommand"
+field = "command_line"
+op = "contains"
+value = "encodedcommand"
+

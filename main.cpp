@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <cstdint>
+#include "src/observability_backends.hpp"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -37,6 +38,7 @@ using SIZE_T = std::size_t;
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -150,6 +152,8 @@ struct ProcessInfo {
     AccessField sid;
     std::string service;
     std::string commandLine;
+    std::string signer = "unknown";
+    std::string hash = "unknown";
 };
 
 struct ProcessGroup {
@@ -166,6 +170,8 @@ struct SystemEntry {
     std::string name;
     std::string detail;
     DWORD pid = 0;
+    std::string signer = "unknown";
+    std::string hash = "unknown";
 };
 
 struct ProcessSnapshot {
@@ -184,6 +190,9 @@ struct ProcessDto {
     std::string sid;
     std::string service;
     std::string commandLine;
+    std::string signer;
+    std::string hash;
+    int childCount = 0;
     double cpu = 0.0;
     SIZE_T workingSet = 0;
     DWORD threads = 0;
@@ -197,6 +206,10 @@ struct SnapshotDto {
     bool huntActive = false;
     DWORD huntPid = 0;
     std::string huntAlert;
+    int recentProcessEvents = 0;
+    int recentServiceEvents = 0;
+    int recentStartupEvents = 0;
+    int recentDriverEvents = 0;
 };
 
 struct AppOptions {
@@ -243,6 +256,19 @@ struct ActionEvent {
     EventType type = EventType::FilterChanged;
     DWORD pid = 0;
     std::string text;
+    long long timestampMs = 0;
+};
+
+enum class HistoryKind { Process, Service, Startup, Driver };
+
+struct HistoryEvent {
+    std::size_t sequence = 0;
+    HistoryKind kind = HistoryKind::Process;
+    std::string action;
+    std::string key;
+    std::string name;
+    std::string detail;
+    DWORD pid = 0;
     long long timestampMs = 0;
 };
 
@@ -606,6 +632,36 @@ std::string TrimCopy(const std::string& value) {
     return std::string(first, last);
 }
 
+std::string FileFingerprint(const std::string& path) {
+    if (path.empty()) {
+        return "unknown";
+    }
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return "unknown";
+    }
+
+    std::uint64_t hash = 1469598103934665603ull;
+    for (char c : path) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+    file.seekg(0, std::ios::end);
+    const auto size = file.tellg();
+    for (char c : std::to_string(static_cast<long long>(size))) {
+        hash ^= static_cast<unsigned char>(c);
+        hash *= 1099511628211ull;
+    }
+
+    std::ostringstream out;
+    out << "fast-fnv1a64:" << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return out.str();
+}
+
+std::string SigningStateForPath(const std::string& path) {
+    return path.empty() ? "unknown" : "unverified";
+}
+
 std::string ReadPromptLine(const std::string& prompt) {
 #ifndef _WIN32
     termios previous{};
@@ -676,6 +732,8 @@ public:
                 info.name = WideToUtf8(entry.szExeFile);
                 info.path = queryImagePath(info.pid);
                 info.commandLine = info.path.value.empty() ? info.name : info.path.value;
+                info.hash = FileFingerprint(info.path.value);
+                info.signer = SigningStateForPath(info.path.value);
                 info.sid = querySid(info.pid);
                 info.workingSet = queryWorkingSet(info.pid);
 
@@ -898,7 +956,8 @@ private:
             char path[MAX_PATH * 2]{};
             GetDeviceDriverBaseNameA(drivers[i], name, static_cast<DWORD>(std::size(name)));
             GetDeviceDriverFileNameA(drivers[i], path, static_cast<DWORD>(std::size(path)));
-            result.push_back({ "driver", name[0] ? name : "<unknown>", path, 0 });
+            const std::string driverPath = path;
+            result.push_back({ "driver", name[0] ? name : "<unknown>", driverPath, 0, SigningStateForPath(driverPath), FileFingerprint(driverPath) });
         }
         return result;
     }
@@ -921,7 +980,7 @@ private:
             }
             if (status == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
                 std::string detail(reinterpret_cast<const char*>(data), strnlen_s(reinterpret_cast<const char*>(data), dataSize));
-                result.push_back({ "registry", std::string(rootName) + "\\" + path + "\\" + valueName, detail, 0 });
+                result.push_back({ "registry", std::string(rootName) + "\\" + path + "\\" + valueName, detail, 0, "unknown", FileFingerprint(detail) });
             }
         }
         RegCloseKey(key);
@@ -1057,6 +1116,8 @@ private:
         readStatus(info, base + "/status");
         info.path = readLinkField(base + "/exe");
         info.commandLine = readCommandLine(base + "/cmdline");
+        info.hash = FileFingerprint(info.path.value);
+        info.signer = SigningStateForPath(info.path.value);
         info.workingSet = readWorkingSet(base + "/statm");
         return true;
     }
@@ -1127,7 +1188,7 @@ private:
             std::string size;
             parser >> name >> size;
             if (!name.empty()) {
-                result.push_back({ "driver", name, "module size " + size, 0 });
+                result.push_back({ "driver", name, "module size " + size, 0, "unknown", "unknown" });
             }
         }
         return result;
@@ -1165,7 +1226,8 @@ private:
                 continue;
             }
             AccessField target = readLinkField(directory + "/" + name);
-            result.push_back({ "startup", name, target.ok() ? target.value : directory + "/" + name, 0 });
+            const std::string targetPath = target.ok() ? target.value : directory + "/" + name;
+            result.push_back({ "startup", name, targetPath, 0, SigningStateForPath(targetPath), FileFingerprint(targetPath) });
         }
         closedir(dir);
     }
@@ -1179,7 +1241,8 @@ private:
         while (dirent* entry = readdir(dir)) {
             const std::string name = entry->d_name;
             if (name.size() > 8 && name.substr(name.size() - 8) == ".desktop") {
-                result.push_back({ "startup", name, directory + "/" + name, 0 });
+                const std::string path = directory + "/" + name;
+                result.push_back({ "startup", name, path, 0, SigningStateForPath(path), FileFingerprint(path) });
             }
         }
         closedir(dir);
@@ -1211,6 +1274,122 @@ private:
     ProcessCollector collector_;
     ProcessSnapshot current_;
     ProcessSnapshot previous_;
+};
+
+std::string HistoryKindName(HistoryKind kind) {
+    switch (kind) {
+    case HistoryKind::Process: return "process";
+    case HistoryKind::Service: return "service";
+    case HistoryKind::Startup: return StartupAreaName();
+    case HistoryKind::Driver: return "driver";
+    }
+    return "process";
+}
+
+class HistoryTracker {
+public:
+    void update(const ProcessSnapshot& previous, const ProcessSnapshot& current, IntegrationHub& hub) {
+        if (!seeded_) {
+            seeded_ = true;
+            return;
+        }
+        updateProcesses(previous.processes, current.processes, hub);
+        updateSystemEntries(HistoryKind::Service, previous.services, current.services);
+        updateSystemEntries(HistoryKind::Startup, previous.registryKeys, current.registryKeys);
+        updateSystemEntries(HistoryKind::Driver, previous.drivers, current.drivers);
+    }
+
+    const std::vector<HistoryEvent>& events() const {
+        return events_;
+    }
+
+    std::vector<HistoryEvent> eventsFor(HistoryKind kind) const {
+        std::vector<HistoryEvent> result;
+        for (const auto& event : events_) {
+            if (event.kind == kind) {
+                result.push_back(event);
+            }
+        }
+        return result;
+    }
+
+    int countFor(HistoryKind kind) const {
+        int total = 0;
+        for (const auto& event : events_) {
+            total += event.kind == kind ? 1 : 0;
+        }
+        return total;
+    }
+
+private:
+    struct SystemState {
+        std::string name;
+        std::string detail;
+        DWORD pid = 0;
+        std::string signer;
+        std::string hash;
+    };
+
+    void updateProcesses(const std::vector<ProcessInfo>& previous, const std::vector<ProcessInfo>& current, IntegrationHub& hub) {
+        std::unordered_map<DWORD, ProcessInfo> oldByPid;
+        std::unordered_map<DWORD, ProcessInfo> newByPid;
+        for (const auto& process : previous) {
+            oldByPid[process.pid] = process;
+        }
+        for (const auto& process : current) {
+            newByPid[process.pid] = process;
+        }
+
+        for (const auto& item : newByPid) {
+            if (oldByPid.count(item.first) == 0) {
+                add(HistoryKind::Process, "started", std::to_string(item.first), item.second.name, item.second.commandLine, item.first);
+                hub.publish(EventType::ViewChanged, item.first, "process started: " + item.second.name);
+            }
+        }
+        for (const auto& item : oldByPid) {
+            if (newByPid.count(item.first) == 0) {
+                add(HistoryKind::Process, "stopped", std::to_string(item.first), item.second.name, item.second.commandLine, item.first);
+                hub.publish(EventType::ViewChanged, item.first, "process stopped: " + item.second.name);
+            }
+        }
+    }
+
+    void updateSystemEntries(HistoryKind kind, const std::vector<SystemEntry>& previous, const std::vector<SystemEntry>& current) {
+        const auto oldItems = indexSystem(previous);
+        const auto newItems = indexSystem(current);
+        for (const auto& item : newItems) {
+            const auto old = oldItems.find(item.first);
+            if (old == oldItems.end()) {
+                add(kind, "added", item.first, item.second.name, item.second.detail, item.second.pid);
+            } else if (old->second.detail != item.second.detail || old->second.pid != item.second.pid || old->second.signer != item.second.signer || old->second.hash != item.second.hash) {
+                add(kind, "changed", item.first, item.second.name, item.second.detail, item.second.pid);
+            }
+        }
+        for (const auto& item : oldItems) {
+            if (newItems.count(item.first) == 0) {
+                add(kind, "removed", item.first, item.second.name, item.second.detail, item.second.pid);
+            }
+        }
+    }
+
+    static std::unordered_map<std::string, SystemState> indexSystem(const std::vector<SystemEntry>& entries) {
+        std::unordered_map<std::string, SystemState> result;
+        for (const auto& entry : entries) {
+            result[entry.type + ":" + entry.name] = { entry.name, entry.detail, entry.pid, entry.signer, entry.hash };
+        }
+        return result;
+    }
+
+    void add(HistoryKind kind, const std::string& action, const std::string& key, const std::string& name, const std::string& detail, DWORD pid) {
+        events_.push_back({ nextSequence_++, kind, action, key, name, detail, pid, UnixTimeMs() });
+        if (events_.size() > 1000) {
+            events_.erase(events_.begin(), events_.begin() + static_cast<std::ptrdiff_t>(events_.size() - 1000));
+        }
+    }
+
+    std::vector<HistoryEvent> events_;
+    std::size_t nextSequence_ = 1;
+    bool seeded_ = false;
 };
 
 class HuntService {
@@ -1309,9 +1488,33 @@ public:
             return false;
         }
 
+        std::ostringstream content;
+        content << file.rdbuf();
+        const std::string text = content.str();
+        const std::string lowerPath = ToLower(path);
+        bool ok = false;
+        if (lowerPath.size() >= 5 && lowerPath.substr(lowerPath.size() - 5) == ".json") {
+            ok = loadJsonRules(text, error);
+        } else if (lowerPath.size() >= 5 && lowerPath.substr(lowerPath.size() - 5) == ".toml") {
+            ok = loadTomlRules(text, error);
+        } else if ((lowerPath.size() >= 5 && lowerPath.substr(lowerPath.size() - 5) == ".yaml") ||
+                   (lowerPath.size() >= 4 && lowerPath.substr(lowerPath.size() - 4) == ".yml")) {
+            ok = loadYamlRules(text, error);
+        } else {
+            ok = loadLineRules(text, error);
+        }
+        if (ok && rules_.empty()) {
+            error = "no valid rules found";
+            return false;
+        }
+        return ok;
+    }
+
+    bool loadLineRules(const std::string& text, std::string& error) {
         std::string line;
         int lineNo = 0;
-        while (std::getline(file, line)) {
+        std::istringstream lines(text);
+        while (std::getline(lines, line)) {
             lineNo += 1;
             const auto comment = line.find('#');
             if (comment != std::string::npos) {
@@ -1322,14 +1525,9 @@ public:
             if (!(parser >> rule.name >> rule.field >> rule.op >> rule.value)) {
                 continue;
             }
-            rule.field = ToLower(rule.field);
-            rule.op = ToLower(rule.op);
-            rule.number = std::strtod(rule.value.c_str(), nullptr);
-            if (!validRule(rule)) {
-                error = "invalid rule at line " + std::to_string(lineNo);
+            if (!appendRule(rule, "line " + std::to_string(lineNo), error)) {
                 return false;
             }
-            rules_.push_back(rule);
         }
         return true;
     }
@@ -1374,6 +1572,172 @@ public:
     }
 
 private:
+    static std::string stripQuotes(std::string value) {
+        value = TrimCopy(value);
+        if (value.size() >= 2 && ((value.front() == '"' && value.back() == '"') || (value.front() == '\'' && value.back() == '\''))) {
+            return value.substr(1, value.size() - 2);
+        }
+        return value;
+    }
+
+    bool appendRule(AlertRule rule, const std::string& source, std::string& error) {
+        rule.name = stripQuotes(rule.name);
+        rule.field = ToLower(stripQuotes(rule.field));
+        rule.op = ToLower(stripQuotes(rule.op));
+        rule.value = stripQuotes(rule.value);
+        rule.number = std::strtod(rule.value.c_str(), nullptr);
+        if (!validRule(rule)) {
+            error = "invalid rule at " + source;
+            return false;
+        }
+        rules_.push_back(std::move(rule));
+        return true;
+    }
+
+    bool loadJsonRules(const std::string& text, std::string& error) {
+        std::size_t pos = 0;
+        int index = 0;
+        while ((pos = text.find('{', pos)) != std::string::npos) {
+            const std::size_t end = text.find('}', pos + 1);
+            if (end == std::string::npos) {
+                error = "unterminated JSON rule object";
+                return false;
+            }
+            const std::string object = text.substr(pos + 1, end - pos - 1);
+            AlertRule rule;
+            rule.name = jsonField(object, "name");
+            rule.field = jsonField(object, "field");
+            rule.op = jsonField(object, "op");
+            rule.value = jsonField(object, "value");
+            pos = end + 1;
+            if (rule.name.empty() && rule.field.empty() && rule.op.empty() && rule.value.empty()) {
+                continue;
+            }
+            index += 1;
+            if (!appendRule(rule, "json rule " + std::to_string(index), error)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool loadTomlRules(const std::string& text, std::string& error) {
+        AlertRule current;
+        bool inRule = false;
+        int index = 0;
+        std::istringstream lines(text);
+        for (std::string line; std::getline(lines, line);) {
+            const auto comment = line.find('#');
+            if (comment != std::string::npos) {
+                line = line.substr(0, comment);
+            }
+            line = TrimCopy(line);
+            if (line.empty()) {
+                continue;
+            }
+            if (line == "[[rules]]") {
+                if (inRule) {
+                    index += 1;
+                    if (!appendRule(current, "toml rule " + std::to_string(index), error)) {
+                        return false;
+                    }
+                    current = AlertRule{};
+                }
+                inRule = true;
+                continue;
+            }
+            if (inRule) {
+                assignKeyValue(current, line, '=');
+            }
+        }
+        if (inRule) {
+            index += 1;
+            return appendRule(current, "toml rule " + std::to_string(index), error);
+        }
+        return true;
+    }
+
+    bool loadYamlRules(const std::string& text, std::string& error) {
+        AlertRule current;
+        bool inRule = false;
+        int index = 0;
+        std::istringstream lines(text);
+        for (std::string line; std::getline(lines, line);) {
+            const auto comment = line.find('#');
+            if (comment != std::string::npos) {
+                line = line.substr(0, comment);
+            }
+            line = TrimCopy(line);
+            if (line.empty() || line == "rules:") {
+                continue;
+            }
+            if (line.rfind("- ", 0) == 0) {
+                if (inRule) {
+                    index += 1;
+                    if (!appendRule(current, "yaml rule " + std::to_string(index), error)) {
+                        return false;
+                    }
+                    current = AlertRule{};
+                }
+                inRule = true;
+                line = TrimCopy(line.substr(2));
+                if (!line.empty()) {
+                    assignKeyValue(current, line, ':');
+                }
+                continue;
+            }
+            if (inRule) {
+                assignKeyValue(current, line, ':');
+            }
+        }
+        if (inRule) {
+            index += 1;
+            return appendRule(current, "yaml rule " + std::to_string(index), error);
+        }
+        return true;
+    }
+
+    static std::string jsonField(const std::string& object, const std::string& key) {
+        const std::string quotedKey = "\"" + key + "\"";
+        std::size_t pos = object.find(quotedKey);
+        if (pos == std::string::npos) {
+            return {};
+        }
+        pos = object.find(':', pos + quotedKey.size());
+        if (pos == std::string::npos) {
+            return {};
+        }
+        pos += 1;
+        while (pos < object.size() && std::isspace(static_cast<unsigned char>(object[pos])) != 0) {
+            pos += 1;
+        }
+        if (pos < object.size() && object[pos] == '"') {
+            std::size_t end = pos + 1;
+            while (end < object.size()) {
+                if (object[end] == '"' && object[end - 1] != '\\') {
+                    break;
+                }
+                end += 1;
+            }
+            return end < object.size() ? object.substr(pos + 1, end - pos - 1) : std::string();
+        }
+        const std::size_t end = object.find_first_of(",\r\n", pos);
+        return TrimCopy(object.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+    }
+
+    static void assignKeyValue(AlertRule& rule, const std::string& line, char delimiter) {
+        const std::size_t split = line.find(delimiter);
+        if (split == std::string::npos) {
+            return;
+        }
+        const std::string key = ToLower(TrimCopy(line.substr(0, split)));
+        const std::string value = stripQuotes(line.substr(split + 1));
+        if (key == "name") rule.name = value;
+        if (key == "field") rule.field = value;
+        if (key == "op") rule.op = value;
+        if (key == "value") rule.value = value;
+    }
+
     static bool validRule(const AlertRule& rule) {
         const bool numeric = rule.op == "gt" || rule.op == "gte" || rule.op == "lt" || rule.op == "lte" || rule.op == "eq";
         const bool text = rule.op == "contains" || rule.op == "eq";
@@ -1395,8 +1759,8 @@ private:
         if (rule.field == "child_count") return std::to_string(childCount);
         if (rule.field == "cpu") return std::to_string(process.cpu);
         if (rule.field == "mem_mb") return MemoryMb(process.workingSet);
-        if (rule.field == "signer") return "unknown";
-        if (rule.field == "hash") return "unknown";
+        if (rule.field == "signer") return process.signer;
+        if (rule.field == "hash") return process.hash;
         return {};
     }
 
@@ -1468,7 +1832,7 @@ public:
         return out.str();
     }
 
-    static std::string prometheusText(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub) {
+    static std::string prometheusText(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const HistoryTracker* history = nullptr) {
         SIZE_T memory = 0;
         double cpu = 0.0;
         int kernel = 0;
@@ -1500,10 +1864,16 @@ public:
             << "cliprocster_rules_loaded " << rules.rules().size() << "\n"
             << "cliprocster_rule_alerts_buffered_total " << ruleAlerts << "\n"
             << "cliprocster_hunt_alerts_buffered_total " << huntAlerts << "\n";
+        if (history) {
+            out << "cliprocster_history_process_events " << history->countFor(HistoryKind::Process) << "\n"
+                << "cliprocster_history_service_events " << history->countFor(HistoryKind::Service) << "\n"
+                << "cliprocster_history_startup_events " << history->countFor(HistoryKind::Startup) << "\n"
+                << "cliprocster_history_driver_events " << history->countFor(HistoryKind::Driver) << "\n";
+        }
         return out.str();
     }
 
-    void writePrometheus(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const std::string& path) {
+    void writePrometheus(const ProcessSnapshot& snapshot, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const std::string& path, const HistoryTracker* history = nullptr) {
         if (path.empty()) {
             return;
         }
@@ -1511,7 +1881,7 @@ public:
         if (!file) {
             return;
         }
-        file << prometheusText(snapshot, ui, rules, hub);
+        file << prometheusText(snapshot, ui, rules, hub, history);
     }
 
 private:
@@ -1551,6 +1921,9 @@ public:
                  << ", \"sid\": \"" << escape(process.sid) << "\""
                  << ", \"service\": \"" << escape(process.service) << "\""
                  << ", \"commandLine\": \"" << escape(process.commandLine) << "\""
+                 << ", \"signer\": \"" << escape(process.signer) << "\""
+                 << ", \"hash\": \"" << escape(process.hash) << "\""
+                 << ", \"childCount\": " << process.childCount
                  << ", \"cpu\": " << std::fixed << std::setprecision(2) << process.cpu
                  << ", \"workingSet\": " << process.workingSet
                  << ", \"threads\": " << process.threads
@@ -1592,7 +1965,7 @@ private:
 
 class SnapshotDtoFactory {
 public:
-    static SnapshotDto make(const ProcessSnapshot& snapshot, const AppOptions& options, const UiState& ui) {
+    static SnapshotDto make(const ProcessSnapshot& snapshot, const AppOptions& options, const UiState& ui, const HistoryTracker* history = nullptr) {
         SnapshotDto dto;
         dto.selectedPid = ui.selectedPid;
         dto.view = ViewName(options.viewMode);
@@ -1600,6 +1973,19 @@ public:
         dto.huntActive = ui.hunt.active;
         dto.huntPid = ui.hunt.pid;
         dto.huntAlert = ui.hunt.alert;
+        if (history) {
+            dto.recentProcessEvents = history->countFor(HistoryKind::Process);
+            dto.recentServiceEvents = history->countFor(HistoryKind::Service);
+            dto.recentStartupEvents = history->countFor(HistoryKind::Startup);
+            dto.recentDriverEvents = history->countFor(HistoryKind::Driver);
+        }
+
+        std::unordered_map<DWORD, int> childCounts;
+        for (const auto& process : snapshot.processes) {
+            if (process.pid != process.parentPid) {
+                childCounts[process.parentPid] += 1;
+            }
+        }
 
         for (const auto& process : snapshot.processes) {
             ProcessDto item;
@@ -1610,6 +1996,9 @@ public:
             item.sid = process.sid.value;
             item.service = process.service;
             item.commandLine = process.commandLine;
+            item.signer = process.signer;
+            item.hash = process.hash;
+            item.childCount = childCounts[process.pid];
             item.cpu = process.cpu;
             item.workingSet = process.workingSet;
             item.threads = process.threads;
@@ -1628,6 +2017,10 @@ std::string SnapshotJson(const SnapshotDto& snapshot) {
     out << "  \"hunt\": { \"active\": " << (snapshot.huntActive ? "true" : "false")
         << ", \"pid\": " << snapshot.huntPid
         << ", \"alert\": \"" << JsonEscape(snapshot.huntAlert) << "\" },\n";
+    out << "  \"history\": { \"processes\": " << snapshot.recentProcessEvents
+        << ", \"services\": " << snapshot.recentServiceEvents
+        << ", \"startup\": " << snapshot.recentStartupEvents
+        << ", \"drivers\": " << snapshot.recentDriverEvents << " },\n";
     out << "  \"processes\": [\n";
     for (std::size_t i = 0; i < snapshot.processes.size(); ++i) {
         const auto& process = snapshot.processes[i];
@@ -1639,6 +2032,9 @@ std::string SnapshotJson(const SnapshotDto& snapshot) {
             << ", \"sid\": \"" << JsonEscape(process.sid) << "\""
             << ", \"service\": \"" << JsonEscape(process.service) << "\""
             << ", \"commandLine\": \"" << JsonEscape(process.commandLine) << "\""
+            << ", \"signer\": \"" << JsonEscape(process.signer) << "\""
+            << ", \"hash\": \"" << JsonEscape(process.hash) << "\""
+            << ", \"childCount\": " << process.childCount
             << ", \"cpu\": " << std::fixed << std::setprecision(2) << process.cpu
             << ", \"workingSet\": " << process.workingSet
             << ", \"threads\": " << process.threads
@@ -1650,12 +2046,52 @@ std::string SnapshotJson(const SnapshotDto& snapshot) {
     return out.str();
 }
 
+std::string RulesJson(const AlertRuleService& rules) {
+    std::ostringstream out;
+    out << "{ \"rules\": [\n";
+    const auto& loaded = rules.rules();
+    for (std::size_t i = 0; i < loaded.size(); ++i) {
+        const auto& rule = loaded[i];
+        out << "  { \"name\": \"" << JsonEscape(rule.name) << "\", \"field\": \"" << JsonEscape(rule.field)
+            << "\", \"op\": \"" << JsonEscape(rule.op) << "\", \"value\": \"" << JsonEscape(rule.value) << "\" }";
+        out << (i + 1 == loaded.size() ? "\n" : ",\n");
+    }
+    out << "] }\n";
+    return out.str();
+}
+
+std::string HistoryJson(const std::vector<HistoryEvent>& events) {
+    std::ostringstream out;
+    out << "{ \"events\": [\n";
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const auto& event = events[i];
+        out << "  { \"seq\": " << event.sequence
+            << ", \"ts\": " << event.timestampMs
+            << ", \"kind\": \"" << JsonEscape(HistoryKindName(event.kind)) << "\""
+            << ", \"action\": \"" << JsonEscape(event.action) << "\""
+            << ", \"key\": \"" << JsonEscape(event.key) << "\""
+            << ", \"name\": \"" << JsonEscape(event.name) << "\""
+            << ", \"detail\": \"" << JsonEscape(event.detail) << "\""
+            << ", \"pid\": " << event.pid << " }";
+        out << (i + 1 == events.size() ? "\n" : ",\n");
+    }
+    out << "] }\n";
+    return out.str();
+}
+
 struct ApiState {
     ProcessSnapshot snapshot;
     UiState ui;
     AppOptions options;
+    std::string snapshotJson;
     std::string events;
     std::string metrics;
+    std::string rules;
+    std::string processHistory;
+    std::string serviceHistory;
+    std::string startupHistory;
+    std::string driverHistory;
+    std::string health;
     bool ready = false;
 };
 
@@ -1700,13 +2136,26 @@ public:
 #endif
     }
 
-    void publish(const ProcessSnapshot& snapshot, const AppOptions& options, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub) {
+    void publish(const ProcessSnapshot& snapshot, const AppOptions& options, const UiState& ui, const AlertRuleService& rules, const IntegrationHub& hub, const HistoryTracker& history) {
         std::lock_guard<std::mutex> lock(mutex_);
         state_.snapshot = snapshot;
         state_.options = options;
         state_.ui = ui;
+        state_.snapshotJson = SnapshotJson(SnapshotDtoFactory::make(snapshot, options, ui, &history));
         state_.events = IntegrationExporter::eventsNdjson(hub);
-        state_.metrics = IntegrationExporter::prometheusText(snapshot, ui, rules, hub);
+        state_.metrics = IntegrationExporter::prometheusText(snapshot, ui, rules, hub, &history);
+        state_.rules = RulesJson(rules);
+        state_.processHistory = HistoryJson(history.eventsFor(HistoryKind::Process));
+        state_.serviceHistory = HistoryJson(history.eventsFor(HistoryKind::Service));
+        state_.startupHistory = HistoryJson(history.eventsFor(HistoryKind::Startup));
+        state_.driverHistory = HistoryJson(history.eventsFor(HistoryKind::Driver));
+        const TraceBackendInfo trace = DetectTraceBackends();
+        state_.health = "{ \"status\": \"ok\", \"app\": \"" + std::string(AppName) +
+            "\", \"processBackend\": \"" + JsonEscape(trace.processBackend) +
+            "\", \"serviceBackend\": \"" + JsonEscape(trace.serviceBackend) +
+            "\", \"startupBackend\": \"" + JsonEscape(trace.startupBackend) +
+            "\", \"driverBackend\": \"" + JsonEscape(trace.driverBackend) +
+            "\", \"ebpfCompiled\": " + (trace.ebpfCompiled ? "true" : "false") + " }\n";
         state_.ready = true;
     }
 
@@ -1792,16 +2241,34 @@ private:
             current = state_;
         }
 
+        if (target == "/health") {
+            const std::string body = current.health.empty()
+                ? "{ \"status\": \"starting\", \"app\": \"" + std::string(AppName) + "\" }\n"
+                : current.health;
+            sendResponse(client, 200, "application/json; charset=utf-8", body);
+            return;
+        }
+
         if (!current.ready) {
             sendResponse(client, 503, "text/plain; charset=utf-8", "snapshot not ready\n");
             return;
         }
         if (target == "/snapshot") {
-            sendResponse(client, 200, "application/json; charset=utf-8", SnapshotJson(SnapshotDtoFactory::make(current.snapshot, current.options, current.ui)));
+            sendResponse(client, 200, "application/json; charset=utf-8", current.snapshotJson);
         } else if (target == "/events") {
             sendResponse(client, 200, "application/x-ndjson; charset=utf-8", current.events);
         } else if (target == "/metrics") {
             sendResponse(client, 200, "text/plain; version=0.0.4; charset=utf-8", current.metrics);
+        } else if (target == "/rules") {
+            sendResponse(client, 200, "application/json; charset=utf-8", current.rules);
+        } else if (target == "/history/processes") {
+            sendResponse(client, 200, "application/json; charset=utf-8", current.processHistory);
+        } else if (target == "/history/services") {
+            sendResponse(client, 200, "application/json; charset=utf-8", current.serviceHistory);
+        } else if (target == "/history/startup") {
+            sendResponse(client, 200, "application/json; charset=utf-8", current.startupHistory);
+        } else if (target == "/history/drivers") {
+            sendResponse(client, 200, "application/json; charset=utf-8", current.driverHistory);
         } else {
             sendResponse(client, 404, "text/plain; charset=utf-8", "not found\n");
         }
@@ -2763,23 +3230,28 @@ private:
 
         if (ui.rightPaneMode == RightPaneMode::Details) {
             if (selected && ui.selectionActive) {
+                const int childCount = static_cast<int>(buildChildrenOfSelected(processes, options, selected->pid).size());
                 printBoxLine(13, col, width, "pid      " + std::to_string(selected->pid), Ansi::Orange);
                 printBoxLine(14, col, width, "ppid     " + std::to_string(selected->parentPid));
                 printBoxLine(15, col, width, "threads  " + std::to_string(selected->threads));
-                printBoxLine(16, col, width, "memory   " + MemoryMb(selected->workingSet) + " MB");
-                printBoxLine(17, col, width, "cpu      " + std::to_string(static_cast<int>(selected->cpu)) + "%");
-                printBoxLine(18, col, width, "service  " + (selected->service.empty() ? "<none>" : selected->service));
-                printBoxLine(19, col, width, "path     " + selected->path.display());
-                int clearFrom = 20;
+                printBoxLine(16, col, width, "children " + std::to_string(childCount));
+                printBoxLine(17, col, width, "memory   " + MemoryMb(selected->workingSet) + " MB");
+                printBoxLine(18, col, width, "cpu      " + std::to_string(static_cast<int>(selected->cpu)) + "%");
+                printBoxLine(19, col, width, "service  " + (selected->service.empty() ? "<none>" : selected->service));
+                printBoxLine(20, col, width, "signer   " + selected->signer);
+                printBoxLine(21, col, width, "hash     " + selected->hash);
+                printBoxLine(22, col, width, "cmd      " + selected->commandLine);
+                printBoxLine(23, col, width, "path     " + selected->path.display());
+                int clearFrom = 24;
                 if (ui.hunt.active && ui.hunt.pid == selected->pid) {
                     std::ostringstream huntLine;
                     huntLine << "hunt     cpu " << std::fixed << std::setprecision(1) << ui.hunt.lastCpu
                              << "% peak " << ui.hunt.peakCpu
                              << "% mem " << MemoryMb(ui.hunt.lastWorkingSet)
                              << "/" << MemoryMb(ui.hunt.peakWorkingSet) << " MB";
-                    printBoxLine(20, col, width, huntLine.str(), ui.hunt.alert.empty() ? Ansi::Green : Ansi::Red);
-                    printBoxLine(21, col, width, "alert    " + (ui.hunt.alert.empty() ? std::string("none") : ui.hunt.alert), ui.hunt.alert.empty() ? Ansi::Dim : Ansi::Red);
-                    clearFrom = 22;
+                    printBoxLine(24, col, width, huntLine.str(), ui.hunt.alert.empty() ? Ansi::Green : Ansi::Red);
+                    printBoxLine(25, col, width, "alert    " + (ui.hunt.alert.empty() ? std::string("none") : ui.hunt.alert), ui.hunt.alert.empty() ? Ansi::Dim : Ansi::Red);
+                    clearFrom = 26;
                 }
                 for (int row = clearFrom; row < height - 5; ++row) {
                     printBoxLine(row, col, width, "");
@@ -2873,9 +3345,11 @@ private:
                      << std::setw(9) << entry.pid
                      << entry.detail;
             } else if (mode == RightPaneMode::Drivers) {
-                line << std::left << std::setw(18) << TrimTo(entry.name, 17) << entry.detail;
+                line << std::left << std::setw(18) << TrimTo(entry.name, 17)
+                     << std::setw(12) << TrimTo(entry.signer, 11)
+                     << entry.detail;
             } else {
-                line << entry.name << " => " << entry.detail;
+                line << entry.name << " [" << entry.signer << "] => " << entry.detail;
             }
             const bool cursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
             printBoxLine(row, col, width, line.str(), cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
@@ -3738,11 +4212,12 @@ public:
             repository_.refresh(options_, false);
             std::this_thread::sleep_for(std::chrono::milliseconds(std::max(100, options_.refreshMs)));
             auto snapshot = repository_.refresh(options_, false);
+            history_.update(repository_.previous(), snapshot, hub_);
             hunt_.update(ui_, snapshot.processes, hub_);
             alertRules_.evaluate(snapshot, ui_, hub_);
             integrations_.writeEvents(hub_, options_.siemEventsPath);
-            integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath);
-            api_.publish(snapshot, options_, ui_, alertRules_, hub_);
+            integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath, &history_);
+            api_.publish(snapshot, options_, ui_, alertRules_, hub_, history_);
             const auto rows = renderer_.rowsForActions(snapshot.processes, options_, ui_);
             if (ui_.selectedPid == 0 && !rows.empty()) {
                 ui_.selectedIndex = 0;
@@ -3778,12 +4253,13 @@ public:
             auto snapshot = repository_.refresh(options_, ui_.paused || modalOpen);
             if (!modalOpen) {
                 updateGoneFade(snapshot.processes);
+                history_.update(repository_.previous(), snapshot, hub_);
                 hunt_.update(ui_, snapshot.processes, hub_);
                 alertRules_.evaluate(snapshot, ui_, hub_);
                 integrations_.writeEvents(hub_, options_.siemEventsPath);
-                integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath);
+                integrations_.writePrometheus(snapshot, ui_, alertRules_, hub_, options_.prometheusPath, &history_);
             }
-            api_.publish(snapshot, options_, ui_, alertRules_, hub_);
+            api_.publish(snapshot, options_, ui_, alertRules_, hub_, history_);
             renderer_.render(snapshot, options_, ui_);
             if (!modalOpen) {
                 tickNotification();
@@ -3837,6 +4313,9 @@ private:
         if (alertRules_.load(options_.rulesPath, error)) {
             ui_.notify(NotificationKind::Success, "loaded alert rules: " + std::to_string(alertRules_.rules().size()));
         } else {
+            if (options_.once) {
+                std::cerr << "rules failed: " << error << "\n";
+            }
             ui_.notify(NotificationKind::Error, "rules failed: " + error, 80);
         }
     }
@@ -4022,6 +4501,7 @@ private:
     AlertRuleService alertRules_;
     IntegrationExporter integrations_;
     LocalHttpApi api_;
+    HistoryTracker history_;
     HuntService hunt_;
     CommandDispatcher dispatcher_{ renderer_, exporter_, hub_ };
 };
