@@ -3904,6 +3904,7 @@ private:
         ui.rightScroll = 0;
         if (tab != AppTab::Processes) {
             clearLiveSortHold(ui);
+            ui.hunt = HuntState{};
         }
         ui.notify(NotificationKind::Info, "tab: " + TabName(tab));
     }
