@@ -263,6 +263,7 @@ struct UiState {
     FocusPane focusPane = FocusPane::ProcessList;
     RightPaneMode rightPaneMode = RightPaneMode::Members;
     int rightSelectedIndex = 0;
+    int rightScroll = 0;
     int scroll = 0;
     int pathScroll = 0;
     bool paused = false;
@@ -291,6 +292,40 @@ bool ContainsText(const std::string& haystack, const std::string& needle) {
     return ToLower(haystack).find(ToLower(needle)) != std::string::npos;
 }
 
+bool MatchesQuery(const std::string& haystack, const std::string& query) {
+    std::istringstream terms(query);
+    for (std::string term; terms >> term;) {
+        if (!ContainsText(haystack, term)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string StartupAreaName() {
+#ifdef _WIN32
+    return "registry";
+#else
+    return "startup";
+#endif
+}
+
+std::string StartupAreaTitle() {
+#ifdef _WIN32
+    return "REGISTRY RUN KEYS";
+#else
+    return "STARTUP ENTRIES";
+#endif
+}
+
+std::string StartupAreaColumnTitle() {
+#ifdef _WIN32
+    return "KEY / VALUE";
+#else
+    return "ENTRY / TARGET";
+#endif
+}
+
 #ifdef _WIN32
 std::string WideToUtf8(const wchar_t* text) {
     if (!text || text[0] == L'\0') {
@@ -305,6 +340,10 @@ std::string WideToUtf8(const wchar_t* text) {
     std::string converted(static_cast<std::size_t>(size - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text, -1, &converted[0], size, nullptr, nullptr);
     return converted;
+}
+
+std::string WideToUtf8(const char* text) {
+    return text ? std::string(text) : std::string();
 }
 #endif
 
@@ -353,7 +392,7 @@ std::string ViewName(ViewMode mode) {
 std::string TabName(AppTab tab) {
     switch (tab) {
     case AppTab::Processes: return "processes";
-    case AppTab::Registry: return "registry";
+    case AppTab::Registry: return StartupAreaName();
     case AppTab::Drivers: return "drivers";
     }
     return "processes";
@@ -366,7 +405,7 @@ std::string RightPaneModeName(RightPaneMode mode) {
     case RightPaneMode::Children: return "children";
     case RightPaneMode::Services: return "services";
     case RightPaneMode::Drivers: return "drivers";
-    case RightPaneMode::Registry: return "registry";
+    case RightPaneMode::Registry: return StartupAreaName();
     }
     return "members";
 }
@@ -387,7 +426,7 @@ const std::vector<CommandMetadata>& CommandRegistry() {
         { Command::HuntFocused, "x", "hunt focused process/member for CPU/memory/missing alerts", "actions" },
         { Command::ToggleHunt, "h", "toggle hunt on selected process", "actions" },
         { Command::ShowProcessTab, "1", "show process table tab", "tabs" },
-        { Command::ShowRegistryTab, "2", "show registry run-key tab", "tabs" },
+        { Command::ShowRegistryTab, "2", "show startup/registry tab", "tabs" },
         { Command::ShowDriversTab, "3", "show kernel driver tab", "tabs" },
         { Command::SubtreeFocused, "g", "set focused process/member as subtree root", "actions" },
         { Command::RequestKill, "k", "confirm kill selected process", "actions" },
@@ -521,7 +560,64 @@ bool MatchesFilter(const ProcessInfo& process, const AppOptions& options) {
 
     const std::string haystack = process.name + " " + process.path.value + " " + process.sid.value + " " +
         process.service + " " + std::to_string(process.pid);
-    return ContainsText(haystack, options.filter);
+    return MatchesQuery(haystack, options.filter);
+}
+
+bool MatchesFilter(const SystemEntry& entry, const AppOptions& options) {
+    if (options.filter.empty()) {
+        return true;
+    }
+    return MatchesQuery(entry.type + " " + entry.name + " " + entry.detail + " " + std::to_string(entry.pid), options.filter);
+}
+
+std::vector<SystemEntry> FilterSystemEntries(const std::vector<SystemEntry>& entries, const AppOptions& options) {
+    std::vector<SystemEntry> filtered;
+    for (const auto& entry : entries) {
+        if (MatchesFilter(entry, options)) {
+            filtered.push_back(entry);
+        }
+    }
+    return filtered;
+}
+
+std::string TrimCopy(const std::string& value) {
+    const auto first = std::find_if_not(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    });
+    const auto last = std::find_if_not(value.rbegin(), value.rend(), [](unsigned char c) {
+        return std::isspace(c) != 0;
+    }).base();
+    if (first >= last) {
+        return {};
+    }
+    return std::string(first, last);
+}
+
+std::string ReadPromptLine(const std::string& prompt) {
+#ifndef _WIN32
+    termios previous{};
+    const bool hasPrevious = tcgetattr(STDIN_FILENO, &previous) == 0;
+    if (hasPrevious) {
+        termios cooked = previous;
+        cooked.c_lflag |= (ICANON | ECHO);
+        cooked.c_cc[VMIN] = 1;
+        cooked.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &cooked);
+    }
+#endif
+
+    std::cout << "\x1b[?25h\n\n" << prompt;
+    std::cout.flush();
+
+    std::string input;
+    std::getline(std::cin, input);
+
+#ifndef _WIN32
+    if (hasPrevious) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &previous);
+    }
+#endif
+    return TrimCopy(input);
 }
 
 class IntegrationHub {
@@ -1013,7 +1109,55 @@ private:
     }
 
     static std::vector<SystemEntry> collectRegistryKeys() {
-        return { { "registry", "not available", "Linux has no Windows registry", 0 } };
+        std::vector<SystemEntry> result;
+        collectStartupLinks(result, "/etc/systemd/system/multi-user.target.wants");
+        collectStartupLinks(result, "/etc/systemd/system/graphical.target.wants");
+        collectStartupLinks(result, "/etc/systemd/system/default.target.wants");
+        collectStartupLinks(result, "/lib/systemd/system/multi-user.target.wants");
+        collectStartupLinks(result, "/usr/lib/systemd/system/multi-user.target.wants");
+        collectDesktopAutostart(result, "/etc/xdg/autostart");
+
+        const char* home = std::getenv("HOME");
+        if (home && *home) {
+            collectDesktopAutostart(result, std::string(home) + "/.config/autostart");
+        }
+
+        std::sort(result.begin(), result.end(), [](const SystemEntry& left, const SystemEntry& right) {
+            return ToLower(left.name) < ToLower(right.name);
+        });
+        return result;
+    }
+
+    static void collectStartupLinks(std::vector<SystemEntry>& result, const std::string& directory) {
+        DIR* dir = opendir(directory.c_str());
+        if (!dir) {
+            return;
+        }
+
+        while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name == "." || name == "..") {
+                continue;
+            }
+            AccessField target = readLinkField(directory + "/" + name);
+            result.push_back({ "startup", name, target.ok() ? target.value : directory + "/" + name, 0 });
+        }
+        closedir(dir);
+    }
+
+    static void collectDesktopAutostart(std::vector<SystemEntry>& result, const std::string& directory) {
+        DIR* dir = opendir(directory.c_str());
+        if (!dir) {
+            return;
+        }
+
+        while (dirent* entry = readdir(dir)) {
+            const std::string name = entry->d_name;
+            if (name.size() > 8 && name.substr(name.size() - 8) == ".desktop") {
+                result.push_back({ "startup", name, directory + "/" + name, 0 });
+            }
+        }
+        closedir(dir);
     }
 
     std::map<DWORD, ProcessTimes> previousTimes_;
@@ -1659,11 +1803,12 @@ public:
 
         stabilizeSelection(ui, rows, layout.visibleRows);
         if (ui.selectionActive) {
-            const auto rightItems = rightPaneItemsForActions(snapshot.processes, options, ui);
-            if (rightItems.empty()) {
-                ui.rightSelectedIndex = 0;
+            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+                const auto entries = rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                clampRightList(ui, static_cast<int>(entries.size()), std::max(0, layout.height - 19));
             } else {
-                ui.rightSelectedIndex = std::max(0, std::min(ui.rightSelectedIndex, static_cast<int>(rightItems.size()) - 1));
+                const auto rightItems = rightPaneItemsForActions(snapshot.processes, options, ui);
+                clampRightList(ui, static_cast<int>(rightItems.size()), std::max(0, layout.height - 22));
             }
         }
 
@@ -1698,6 +1843,29 @@ public:
         }
         if (ui.rightPaneMode == RightPaneMode::Members) {
             return buildSelectedGroupMembers(processes, options, ui.selectedPid);
+        }
+        return {};
+    }
+
+    std::vector<SystemEntry> systemEntriesForActions(const ProcessSnapshot& snapshot, const AppOptions& options, AppTab tab) const {
+        if (tab == AppTab::Registry) {
+            return FilterSystemEntries(snapshot.registryKeys, options);
+        }
+        if (tab == AppTab::Drivers) {
+            return FilterSystemEntries(snapshot.drivers, options);
+        }
+        return {};
+    }
+
+    std::vector<SystemEntry> rightSystemEntriesForActions(const ProcessSnapshot& snapshot, const AppOptions& options, RightPaneMode mode) const {
+        if (mode == RightPaneMode::Services) {
+            return FilterSystemEntries(snapshot.services, options);
+        }
+        if (mode == RightPaneMode::Drivers) {
+            return FilterSystemEntries(snapshot.drivers, options);
+        }
+        if (mode == RightPaneMode::Registry) {
+            return FilterSystemEntries(snapshot.registryKeys, options);
         }
         return {};
     }
@@ -1957,6 +2125,23 @@ private:
         ui.scroll = std::max(0, std::min(ui.scroll, std::max(0, static_cast<int>(rows.size()) - visibleRows)));
     }
 
+    static void clampRightList(UiState& ui, int itemCount, int visibleRows) {
+        if (itemCount <= 0) {
+            ui.rightSelectedIndex = 0;
+            ui.rightScroll = 0;
+            return;
+        }
+
+        ui.rightSelectedIndex = std::max(0, std::min(ui.rightSelectedIndex, itemCount - 1));
+        ui.rightScroll = std::max(0, std::min(ui.rightScroll, std::max(0, itemCount - visibleRows)));
+        if (ui.rightSelectedIndex < ui.rightScroll) {
+            ui.rightScroll = ui.rightSelectedIndex;
+        }
+        if (visibleRows > 0 && ui.rightSelectedIndex >= ui.rightScroll + visibleRows) {
+            ui.rightScroll = ui.rightSelectedIndex - visibleRows + 1;
+        }
+    }
+
     static std::string fitLine(const std::string& text, int width) {
         if (width <= 0) {
             return {};
@@ -2017,8 +2202,8 @@ private:
               << " | " << (ui.paused ? "paused" : "live");
         printBoxLine(1, 1, width, title.str(), Ansi::Cyan);
         const std::string hints = width >= 112
-            ? "1 proc | 2 registry | 3 drivers | F1 help | PgUp/PgDn | Tab pane | Enter select | x hunt | q quit"
-            : "1 proc | 2 registry | 3 drivers | F1 help | PgUp/PgDn | Enter select | q quit";
+            ? "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | Tab pane | q quit"
+            : "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | q quit";
         printBoxLine(2, 1, width, hints, Ansi::Dim);
     }
 
@@ -2122,7 +2307,9 @@ private:
     }
 
     static void renderSystemTab(const ProcessSnapshot& snapshot, const AppOptions& options, UiState& ui, const Layout& layout) {
-        const std::vector<SystemEntry>& entries = ui.activeTab == AppTab::Registry ? snapshot.registryKeys : snapshot.drivers;
+        const std::vector<SystemEntry> entries = ui.activeTab == AppTab::Registry
+            ? FilterSystemEntries(snapshot.registryKeys, options)
+            : FilterSystemEntries(snapshot.drivers, options);
         ui.focusPane = FocusPane::ProcessList;
         ui.selectedIndex = std::max(0, std::min(ui.selectedIndex, std::max(0, static_cast<int>(entries.size()) - 1)));
         ui.scroll = std::max(0, std::min(ui.scroll, std::max(0, static_cast<int>(entries.size()) - layout.visibleRows)));
@@ -2135,12 +2322,12 @@ private:
 
         std::cout << "\x1b[?25l\x1b[H";
         renderHeader(layout.width, options, ui);
-        const std::string title = ui.activeTab == AppTab::Registry ? "REGISTRY RUN KEYS" : "KERNEL DRIVERS";
+        const std::string title = ui.activeTab == AppTab::Registry ? StartupAreaTitle() : "KERNEL DRIVERS";
         printBoxLine(4, 1, layout.width, title, Ansi::Cyan);
-        printBoxLine(5, 1, layout.width, ui.activeTab == AppTab::Registry ? "KEY / VALUE" : "DRIVER / PATH", Ansi::Dim);
+        printBoxLine(5, 1, layout.width, ui.activeTab == AppTab::Registry ? StartupAreaColumnTitle() : "DRIVER / PATH", Ansi::Dim);
 
         if (entries.empty()) {
-            printBoxLine(7, 3, layout.width - 4, "No entries visible or access denied.", Ansi::Orange);
+            printBoxLine(7, 3, layout.width - 4, options.filter.empty() ? "No entries visible or access denied." : "No entries match the filter.", Ansi::Orange);
         }
 
         for (int i = 0; i < layout.visibleRows; ++i) {
@@ -2159,7 +2346,7 @@ private:
         std::ostringstream status;
         status << "tab " << TabName(ui.activeTab)
                << " | rows " << (entries.empty() ? 0 : ui.selectedIndex + 1) << "/" << entries.size()
-               << " | 1 processes | 2 registry | 3 drivers | " << (ui.message.text.empty() ? "ready" : ui.message.text);
+               << " | 1 processes | 2 " << StartupAreaName() << " | 3 drivers | / filter | " << (ui.message.text.empty() ? "ready" : ui.message.text);
         printBoxLine(layout.height, 1, layout.width, status.str(), ui.message.ttlFrames > 0 ? notificationColor(ui.message.kind) : Ansi::Dim);
         std::cout << "\x1b[J";
     }
@@ -2271,10 +2458,10 @@ private:
         printBoxLine(12, col, width, "RIGHT PANE [" + RightPaneModeName(ui.rightPaneMode) + "]  [ ] switch", Ansi::Cyan);
 
         if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-            const std::vector<SystemEntry>& entries = ui.rightPaneMode == RightPaneMode::Services
-                ? snapshot.services
-                : (ui.rightPaneMode == RightPaneMode::Drivers ? snapshot.drivers : snapshot.registryKeys);
-            renderSystemEntries(col, width, height, entries, ui.rightPaneMode);
+            const std::vector<SystemEntry> entries = ui.rightPaneMode == RightPaneMode::Services
+                ? FilterSystemEntries(snapshot.services, options)
+                : (ui.rightPaneMode == RightPaneMode::Drivers ? FilterSystemEntries(snapshot.drivers, options) : FilterSystemEntries(snapshot.registryKeys, options));
+            renderSystemEntries(col, width, height, entries, ui);
             return;
         }
 
@@ -2344,14 +2531,15 @@ private:
             const int maxMembers = std::max(0, height - 22);
             for (int i = 0; i < maxMembers; ++i) {
                 const int rowNo = 16 + i;
-                if (i >= static_cast<int>(items.size())) {
+                const int index = ui.rightScroll + i;
+                if (index >= static_cast<int>(items.size())) {
                     if (rowNo > 16 || !items.empty()) {
                         printBoxLine(rowNo, col, width, "");
                     }
                     continue;
                 }
 
-                const auto& item = items[static_cast<std::size_t>(i)];
+                const auto& item = items[static_cast<std::size_t>(index)];
                 std::ostringstream row;
                 row << std::left
                     << std::setw(7) << item.pid
@@ -2359,7 +2547,7 @@ private:
                     << std::setw(9) << MemoryMb(item.workingSet)
                     << (item.service.empty() ? item.name : item.service);
 
-                const bool isRightCursor = ui.focusPane == FocusPane::GroupMembers && i == ui.rightSelectedIndex;
+                const bool isRightCursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
                 const bool isSelectedMember = selected && item.pid == selected->pid;
                 const bool isHuntedMember = ui.hunt.active && item.pid == ui.hunt.pid;
                 printBoxLine(rowNo, col, width, row.str(), isRightCursor ? (isSelectedMember ? Ansi::OrangeBg : Ansi::FocusBg) : (isSelectedMember ? Ansi::Orange : (isHuntedMember ? Ansi::Green : Ansi::Reset)));
@@ -2378,25 +2566,27 @@ private:
         printBoxLine(height - 1, col, width, focusHint(ui), Ansi::Dim);
     }
 
-    static void renderSystemEntries(int col, int width, int height, const std::vector<SystemEntry>& entries, RightPaneMode mode) {
+    static void renderSystemEntries(int col, int width, int height, const std::vector<SystemEntry>& entries, const UiState& ui) {
+        const RightPaneMode mode = ui.rightPaneMode;
         std::string heading;
         if (mode == RightPaneMode::Services) {
             heading = "service        pid      state";
         } else if (mode == RightPaneMode::Drivers) {
             heading = "kernel driver  path";
         } else {
-            heading = "registry run key";
+            heading = StartupAreaColumnTitle();
         }
 
         printBoxLine(13, col, width, heading, Ansi::Dim);
         const int maxRows = std::max(0, height - 19);
         for (int i = 0; i < maxRows; ++i) {
             const int row = 15 + i;
-            if (i >= static_cast<int>(entries.size())) {
+            const int index = ui.rightScroll + i;
+            if (index >= static_cast<int>(entries.size())) {
                 printBoxLine(row, col, width, "");
                 continue;
             }
-            const auto& entry = entries[static_cast<std::size_t>(i)];
+            const auto& entry = entries[static_cast<std::size_t>(index)];
             std::ostringstream line;
             if (mode == RightPaneMode::Services) {
                 line << std::left << std::setw(15) << TrimTo(entry.name, 14)
@@ -2407,13 +2597,14 @@ private:
             } else {
                 line << entry.name << " => " << entry.detail;
             }
-            printBoxLine(row, col, width, line.str(), mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset);
+            const bool cursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
+            printBoxLine(row, col, width, line.str(), cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
         }
 
         printBoxLine(height - 4, col, width, "TRACE SUMMARY", Ansi::Cyan);
         printBoxLine(height - 3, col, width, std::to_string(entries.size()) + " " + RightPaneModeName(mode) + " entries", Ansi::Dim);
-        printBoxLine(height - 2, col, width, "SIEM: --siem-events file.ndjson", Ansi::Dim);
-        printBoxLine(height - 1, col, width, "Prometheus: --prometheus-file file.prom", Ansi::Dim);
+        printBoxLine(height - 2, col, width, entries.empty() ? "no filtered entries" : "Enter follows PID when available", Ansi::Dim);
+        printBoxLine(height - 1, col, width, focusHint(ui), Ansi::Dim);
     }
 
     static std::string focusHint(const UiState& ui) {
@@ -2497,7 +2688,7 @@ private:
         }
 
         printBoxLine(1, 1, width, std::string(AppName) + " help", Ansi::Cyan);
-        printBoxLine(2, 1, width, "F1/? close help | Esc back | 1 processes | 2 registry | 3 drivers", Ansi::Dim);
+        printBoxLine(2, 1, width, "F1/? close help | Esc back | 1 processes | 2 " + StartupAreaName() + " | 3 drivers", Ansi::Dim);
         printBoxLine(4, 1, width, "Hunt mode", Ansi::Orange);
         printBoxLine(5, 1, width, "x arms hunt on the focused row/member. h toggles hunt on the selected process.", Ansi::Dim);
         printBoxLine(6, 1, width, "It watches CPU >= 18%, memory jumps >= 80 MB, missing PID, and same-name PID reacquire.", Ansi::Dim);
@@ -2633,14 +2824,24 @@ public:
             break;
         case Command::PromptFilter:
             promptFilter(options, ui);
-            preserveSelection(ui, snapshot, options);
+            if (ui.activeTab == AppTab::Processes) {
+                preserveSelection(ui, snapshot, options);
+            }
             hub_.publish(EventType::FilterChanged, ui.selectedPid, "filter: " + options.filter);
             break;
         case Command::ClearContext:
             options.filter.clear();
             options.subtreePid = 0;
             ui.pathScroll = 0;
-            preserveSelection(ui, snapshot, options);
+            ui.rightSelectedIndex = 0;
+            ui.rightScroll = 0;
+            clearLiveSortHold(ui);
+            if (ui.activeTab == AppTab::Processes) {
+                preserveSelection(ui, snapshot, options);
+            } else {
+                ui.scroll = 0;
+                ui.selectedIndex = 0;
+            }
             ui.notify(NotificationKind::Info, "filter/subtree cleared");
             break;
         case Command::PromptSubtree:
@@ -2728,14 +2929,8 @@ private:
         ui.sortOrderPinned = true;
     }
 
-    static int systemTabCount(const ProcessSnapshot& snapshot, AppTab tab) {
-        if (tab == AppTab::Registry) {
-            return static_cast<int>(snapshot.registryKeys.size());
-        }
-        if (tab == AppTab::Drivers) {
-            return static_cast<int>(snapshot.drivers.size());
-        }
-        return 0;
+    int systemTabCount(const ProcessSnapshot& snapshot, const AppOptions& options, AppTab tab) const {
+        return static_cast<int>(renderer_.systemEntriesForActions(snapshot, options, tab).size());
     }
 
     static void switchTab(UiState& ui, AppTab tab) {
@@ -2744,6 +2939,7 @@ private:
         ui.scroll = 0;
         ui.selectedIndex = 0;
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
         if (tab != AppTab::Processes) {
             ui.selectionActive = false;
             ui.selectedPid = 0;
@@ -2777,7 +2973,7 @@ private:
 
     void moveSelection(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options, int delta) {
         if (ui.activeTab != AppTab::Processes) {
-            const int count = systemTabCount(snapshot, ui.activeTab);
+            const int count = systemTabCount(snapshot, options, ui.activeTab);
             if (count == 0) {
                 ui.selectedIndex = 0;
                 ui.scroll = 0;
@@ -2805,6 +3001,7 @@ private:
         ui.selectedPid = rows[static_cast<std::size_t>(ui.selectedIndex)].pid;
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
     }
 
     void moveRightSelection(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options, int delta) {
@@ -2813,7 +3010,14 @@ private:
             return;
         }
         if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-            ui.notify(NotificationKind::Info, "trace pane is read-only; use [ or ]");
+            const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+            if (entries.empty()) {
+                ui.rightSelectedIndex = 0;
+                ui.rightScroll = 0;
+                ui.notify(NotificationKind::Warning, "right pane has no filtered entries");
+                return;
+            }
+            ui.rightSelectedIndex = std::max(0, std::min(ui.rightSelectedIndex + delta, static_cast<int>(entries.size()) - 1));
             return;
         }
         if (ui.rightPaneMode == RightPaneMode::Details) {
@@ -2824,6 +3028,7 @@ private:
         const auto members = renderer_.rightPaneItemsForActions(snapshot.processes, options, ui);
         if (members.empty()) {
             ui.rightSelectedIndex = 0;
+            ui.rightScroll = 0;
             ui.notify(NotificationKind::Warning, "selected group has no visible members");
             return;
         }
@@ -2833,14 +3038,27 @@ private:
 
     void jumpSelection(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options, bool bottom) {
         if (ui.activeTab != AppTab::Processes) {
-            const int count = systemTabCount(snapshot, ui.activeTab);
+            const int count = systemTabCount(snapshot, options, ui.activeTab);
             ui.selectedIndex = count == 0 ? 0 : (bottom ? count - 1 : 0);
             return;
         }
         if (ui.focusPane == FocusPane::GroupMembers) {
+            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                if (entries.empty()) {
+                    ui.rightSelectedIndex = 0;
+                    ui.rightScroll = 0;
+                    ui.notify(NotificationKind::Warning, "right pane has no filtered entries");
+                    return;
+                }
+                ui.rightSelectedIndex = bottom ? static_cast<int>(entries.size()) - 1 : 0;
+                ui.notify(NotificationKind::Info, bottom ? "right pane: bottom" : "right pane: top");
+                return;
+            }
             const auto members = renderer_.rightPaneItemsForActions(snapshot.processes, options, ui);
             if (members.empty()) {
                 ui.rightSelectedIndex = 0;
+                ui.rightScroll = 0;
                 ui.notify(NotificationKind::Warning, "right pane has no members");
                 return;
             }
@@ -2863,6 +3081,7 @@ private:
         ui.selectedPid = rows[static_cast<std::size_t>(ui.selectedIndex)].pid;
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
         ui.notify(NotificationKind::Info, bottom ? "process list: bottom" : "process list: top");
     }
 
@@ -2891,13 +3110,19 @@ private:
     void cycleRightPaneMode(UiState& ui, bool forward) {
         ui.rightPaneMode = nextRightPaneMode(ui.rightPaneMode, forward);
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
         ui.notify(NotificationKind::Info, "right pane: " + RightPaneModeName(ui.rightPaneMode));
     }
 
     DWORD focusedPid(const UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
         if (ui.focusPane == FocusPane::GroupMembers && ui.rightPaneMode != RightPaneMode::Details) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                return ui.selectionActive ? ui.selectedPid : 0;
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                if (!entries.empty()) {
+                    const int index = std::max(0, std::min(ui.rightSelectedIndex, static_cast<int>(entries.size()) - 1));
+                    return entries[static_cast<std::size_t>(index)].pid;
+                }
+                return 0;
             }
             const auto items = renderer_.rightPaneItemsForActions(snapshot.processes, options, ui);
             if (!items.empty()) {
@@ -2965,12 +3190,14 @@ private:
                 ui.selectedPid = pid;
                 ui.selectionActive = true;
                 ui.rightSelectedIndex = 0;
+                ui.rightScroll = 0;
                 return;
             }
         }
         ui.selectedPid = pid;
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
     }
 
     void toggleFocusPane(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
@@ -2984,8 +3211,11 @@ private:
                 return;
             }
             if (ui.rightPaneMode != RightPaneMode::Details) {
-                const auto members = renderer_.rightPaneItemsForActions(snapshot.processes, options, ui);
-                if (members.empty()) {
+                const bool systemMode = ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry;
+                const bool hasItems = systemMode
+                    ? !renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode).empty()
+                    : !renderer_.rightPaneItemsForActions(snapshot.processes, options, ui).empty();
+                if (!hasItems) {
                     ui.notify(NotificationKind::Warning, "right pane has no visible items");
                 }
             }
@@ -3000,7 +3230,19 @@ private:
     void activateFocusedItem(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                ui.notify(NotificationKind::Info, "trace pane is read-only");
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                if (entries.empty()) {
+                    ui.notify(NotificationKind::Warning, "nothing in right pane to select");
+                    return;
+                }
+                ui.rightSelectedIndex = std::max(0, std::min(ui.rightSelectedIndex, static_cast<int>(entries.size()) - 1));
+                const DWORD pid = entries[static_cast<std::size_t>(ui.rightSelectedIndex)].pid;
+                if (pid == 0 || !pidExists(snapshot, pid)) {
+                    ui.notify(NotificationKind::Info, "entry has no live process PID");
+                    return;
+                }
+                selectPid(ui, snapshot, options, pid);
+                ui.notify(NotificationKind::Success, "selected PID " + std::to_string(ui.selectedPid));
                 return;
             }
             if (ui.rightPaneMode == RightPaneMode::Details) {
@@ -3027,6 +3269,8 @@ private:
         holdLiveSort(ui, rows, options);
         ui.selectedPid = rows[static_cast<std::size_t>(ui.selectedIndex)].pid;
         ui.selectionActive = true;
+        ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
         ui.notify(NotificationKind::Success, "selected PID " + std::to_string(ui.selectedPid));
     }
 
@@ -3034,16 +3278,18 @@ private:
         ui.selectionActive = false;
         ui.selectedPid = 0;
         ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
         ui.focusPane = FocusPane::ProcessList;
         clearLiveSortHold(ui);
         ui.notify(NotificationKind::Info, "selection cleared");
     }
 
     static void promptFilter(AppOptions& options, UiState& ui) {
-        std::cout << "\n\nfilter > ";
-        std::cout.flush();
-        std::getline(std::cin, options.filter);
+        options.filter = ReadPromptLine("filter (name, pid, path, service, startup, driver; empty clears) > ");
         ui.scroll = 0;
+        ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
+        clearLiveSortHold(ui);
         ui.notify(NotificationKind::Success, options.filter.empty() ? "filter cleared" : "filter applied: " + options.filter);
     }
 
@@ -3057,11 +3303,7 @@ private:
     }
 
     static void promptSubtree(AppOptions& options, UiState& ui, const ProcessSnapshot& snapshot) {
-        std::cout << "\n\nsubtree PID (0 clears) > ";
-        std::cout.flush();
-
-        std::string input;
-        std::getline(std::cin, input);
+        const std::string input = ReadPromptLine("subtree PID (0 clears) > ");
 
         std::istringstream parser(input);
         DWORD pid = 0;
