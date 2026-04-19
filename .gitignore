@@ -5,6 +5,10 @@ start/
 Win32/
 Debug/
 Release/
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
 *.user
 *.suo
 *.VC.db

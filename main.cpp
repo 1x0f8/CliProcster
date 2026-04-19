@@ -1,16 +1,31 @@
 #define NOMINMAX
+#include <cstdint>
+#ifdef _WIN32
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <sddl.h>
 #include <winsvc.h>
+#include <conio.h>
+#else
+#include <dirent.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
+
+using DWORD = std::uint32_t;
+using SIZE_T = std::size_t;
+#endif
 
 #include <algorithm>
 #include <cstdlib>
 #include <chrono>
-#include <conio.h>
+#include <cerrno>
 #include <cctype>
-#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -22,8 +37,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Advapi32.lib")
+#endif
 
 namespace {
 
@@ -274,6 +291,7 @@ bool ContainsText(const std::string& haystack, const std::string& needle) {
     return ToLower(haystack).find(ToLower(needle)) != std::string::npos;
 }
 
+#ifdef _WIN32
 std::string WideToUtf8(const wchar_t* text) {
     if (!text || text[0] == L'\0') {
         return {};
@@ -288,6 +306,7 @@ std::string WideToUtf8(const wchar_t* text) {
     WideCharToMultiByte(CP_UTF8, 0, text, -1, &converted[0], size, nullptr, nullptr);
     return converted;
 }
+#endif
 
 std::string TrimTo(std::string text, std::size_t width) {
     if (text.size() <= width) {
@@ -383,6 +402,7 @@ const std::vector<CommandMetadata>& CommandRegistry() {
     return commands;
 }
 
+#ifdef _WIN32
 std::string FormatLastError(DWORD error = GetLastError()) {
     if (error == 0) {
         return "no error detail";
@@ -409,13 +429,20 @@ std::string FormatLastError(DWORD error = GetLastError()) {
     }
     return text;
 }
+#else
+std::string FormatLastError(int error = errno) {
+    return std::strerror(error);
+}
+#endif
 
+#ifdef _WIN32
 unsigned long long FileTimeToTicks(const FILETIME& value) {
     ULARGE_INTEGER converted{};
     converted.LowPart = value.dwLowDateTime;
     converted.HighPart = value.dwHighDateTime;
     return converted.QuadPart;
 }
+#endif
 
 bool IsKernelProcess(const ProcessInfo& process) {
     const std::string name = ToLower(process.name);
@@ -515,6 +542,7 @@ private:
     std::size_t nextSequence_ = 1;
 };
 
+#ifdef _WIN32
 class ProcessCollector {
 public:
     ProcessSnapshot collect(const AppOptions& options) {
@@ -799,6 +827,198 @@ private:
 
     std::map<DWORD, ProcessTimes> previousTimes_;
 };
+#else
+class ProcessCollector {
+public:
+    ProcessSnapshot collect(const AppOptions& options) {
+        const unsigned long long systemTicks = currentSystemTicks();
+        ProcessSnapshot snapshot;
+        std::map<DWORD, ProcessTimes> currentTimes;
+
+        DIR* proc = opendir("/proc");
+        if (!proc) {
+            return snapshot;
+        }
+
+        while (dirent* entry = readdir(proc)) {
+            if (!isNumeric(entry->d_name)) {
+                continue;
+            }
+            ProcessInfo info;
+            info.pid = static_cast<DWORD>(std::strtoul(entry->d_name, nullptr, 10));
+            if (!readProcess(info, systemTicks, currentTimes)) {
+                continue;
+            }
+            snapshot.processes.push_back(std::move(info));
+        }
+        closedir(proc);
+
+        previousTimes_ = std::move(currentTimes);
+        snapshot.services = collectServices();
+        snapshot.drivers = collectDrivers();
+        snapshot.registryKeys = collectRegistryKeys();
+
+        std::sort(snapshot.processes.begin(), snapshot.processes.end(), [&](const ProcessInfo& left, const ProcessInfo& right) {
+            return ComesBefore(left, right, options.sortMode);
+        });
+        return snapshot;
+    }
+
+private:
+    static bool isNumeric(const char* text) {
+        if (!text || !*text) {
+            return false;
+        }
+        for (const char* p = text; *p; ++p) {
+            if (!std::isdigit(static_cast<unsigned char>(*p))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static std::string readFile(const std::string& path) {
+        std::ifstream file(path);
+        if (!file) {
+            return {};
+        }
+        std::ostringstream out;
+        out << file.rdbuf();
+        return out.str();
+    }
+
+    static std::string readFirstLine(const std::string& path) {
+        std::ifstream file(path);
+        std::string line;
+        std::getline(file, line);
+        return line;
+    }
+
+    static AccessField readLinkField(const std::string& path) {
+        std::vector<char> buffer(4096);
+        const ssize_t size = readlink(path.c_str(), buffer.data(), buffer.size() - 1);
+        if (size < 0) {
+            return { {}, FormatLastError(errno) };
+        }
+        return { std::string(buffer.data(), static_cast<std::size_t>(size)), {} };
+    }
+
+    static unsigned long long currentSystemTicks() {
+        std::ifstream file("/proc/stat");
+        std::string label;
+        unsigned long long total = 0;
+        file >> label;
+        for (unsigned long long value = 0; file >> value;) {
+            total += value;
+        }
+        return total;
+    }
+
+    static bool readProcess(ProcessInfo& info, unsigned long long systemTicks, std::map<DWORD, ProcessTimes>& currentTimes) {
+        const std::string base = "/proc/" + std::to_string(info.pid);
+        const std::string stat = readFile(base + "/stat");
+        const auto open = stat.find('(');
+        const auto close = stat.rfind(')');
+        if (open == std::string::npos || close == std::string::npos || close <= open) {
+            return false;
+        }
+
+        info.name = stat.substr(open + 1, close - open - 1);
+        std::istringstream tail(stat.substr(close + 2));
+        std::vector<std::string> fields;
+        for (std::string field; tail >> field;) {
+            fields.push_back(field);
+        }
+        if (fields.size() < 22) {
+            return false;
+        }
+
+        info.parentPid = static_cast<DWORD>(std::strtoul(fields[1].c_str(), nullptr, 10));
+        const unsigned long long utime = std::strtoull(fields[11].c_str(), nullptr, 10);
+        const unsigned long long stime = std::strtoull(fields[12].c_str(), nullptr, 10);
+        const unsigned long long processTicks = utime + stime;
+        currentTimes[info.pid] = { processTicks, systemTicks };
+
+        const auto old = previousTimes_.find(info.pid);
+        if (old != previousTimes_.end() && systemTicks > old->second.systemTicks && processTicks >= old->second.processTicks) {
+            info.cpu = (static_cast<double>(processTicks - old->second.processTicks) / static_cast<double>(systemTicks - old->second.systemTicks)) * 100.0;
+        }
+
+        readStatus(info, base + "/status");
+        info.path = readLinkField(base + "/exe");
+        info.workingSet = readWorkingSet(base + "/statm");
+        return true;
+    }
+
+    static void readStatus(ProcessInfo& info, const std::string& path) {
+        std::ifstream file(path);
+        for (std::string line; std::getline(file, line);) {
+            if (line.rfind("Threads:", 0) == 0) {
+                info.threads = static_cast<DWORD>(std::strtoul(line.substr(8).c_str(), nullptr, 10));
+            } else if (line.rfind("Uid:", 0) == 0) {
+                std::istringstream parser(line.substr(4));
+                std::string uid;
+                parser >> uid;
+                info.sid = { "uid:" + uid, {} };
+            }
+        }
+    }
+
+    static SIZE_T readWorkingSet(const std::string& path) {
+        std::ifstream file(path);
+        unsigned long pages = 0;
+        unsigned long rss = 0;
+        file >> pages >> rss;
+        return static_cast<SIZE_T>(rss) * static_cast<SIZE_T>(sysconf(_SC_PAGESIZE));
+    }
+
+    static std::vector<SystemEntry> collectServices() {
+        std::vector<SystemEntry> result;
+        collectSystemdUnits(result, "/etc/systemd/system");
+        collectSystemdUnits(result, "/lib/systemd/system");
+        collectSystemdUnits(result, "/usr/lib/systemd/system");
+        std::sort(result.begin(), result.end(), [](const SystemEntry& left, const SystemEntry& right) {
+            return ToLower(left.name) < ToLower(right.name);
+        });
+        return result;
+    }
+
+    static void collectSystemdUnits(std::vector<SystemEntry>& result, const std::string& directory) {
+        DIR* dir = opendir(directory.c_str());
+        if (!dir) {
+            return;
+        }
+        while (dirent* entry = readdir(dir)) {
+            std::string name = entry->d_name;
+            if (name.size() > 8 && name.substr(name.size() - 8) == ".service") {
+                result.push_back({ "service", name, directory + "/" + name, 0 });
+            }
+        }
+        closedir(dir);
+    }
+
+    static std::vector<SystemEntry> collectDrivers() {
+        std::vector<SystemEntry> result;
+        std::ifstream file("/proc/modules");
+        for (std::string line; std::getline(file, line);) {
+            std::istringstream parser(line);
+            std::string name;
+            std::string size;
+            parser >> name >> size;
+            if (!name.empty()) {
+                result.push_back({ "driver", name, "module size " + size, 0 });
+            }
+        }
+        return result;
+    }
+
+    static std::vector<SystemEntry> collectRegistryKeys() {
+        return { { "registry", "not available", "Linux has no Windows registry", 0 } };
+    }
+
+    std::map<DWORD, ProcessTimes> previousTimes_;
+};
+#endif
 
 class ProcessRepository {
 public:
@@ -1199,6 +1419,7 @@ public:
 class ConsoleWindow {
 public:
     static void enableVirtualTerminal() {
+#ifdef _WIN32
         HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
         if (output == INVALID_HANDLE_VALUE) {
             return;
@@ -1216,8 +1437,10 @@ public:
             mode &= ~ENABLE_INSERT_MODE;
             SetConsoleMode(input, mode);
         }
+#endif
     }
 
+#ifdef _WIN32
     static CONSOLE_SCREEN_BUFFER_INFO info() {
         CONSOLE_SCREEN_BUFFER_INFO value{};
         if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &value)) {
@@ -1228,13 +1451,22 @@ public:
         }
         return value;
     }
+#endif
 
     static ConsoleSize size() {
+#ifdef _WIN32
         const auto value = info();
         return {
             std::max(1, static_cast<int>(value.srWindow.Right - value.srWindow.Left + 1)),
             std::max(1, static_cast<int>(value.srWindow.Bottom - value.srWindow.Top + 1))
         };
+#else
+        winsize value{};
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &value) == 0 && value.ws_col > 0 && value.ws_row > 0) {
+            return { static_cast<int>(value.ws_col), static_cast<int>(value.ws_row) };
+        }
+        return { 120, 35 };
+#endif
     }
 
     static int width() {
@@ -1248,14 +1480,36 @@ public:
 
 class InputController {
 public:
+    InputController() {
+#ifndef _WIN32
+        if (tcgetattr(STDIN_FILENO, &originalTermios_) == 0) {
+            termios raw = originalTermios_;
+            raw.c_lflag &= ~(ICANON | ECHO);
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+            configured_ = true;
+        }
+#endif
+    }
+
+    ~InputController() {
+#ifndef _WIN32
+        if (configured_) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &originalTermios_);
+        }
+#endif
+    }
+
     Command readCommand() const {
-        if (!_kbhit()) {
+        if (!hasKey()) {
             return Command::None;
         }
 
-        int key = _getch();
+        int key = readKey();
+#ifdef _WIN32
         if (key == 0 || key == 224) {
-            key = _getch();
+            key = readKey();
             const bool tabHeld = (GetAsyncKeyState(VK_TAB) & 0x8000) != 0;
             switch (key) {
             case 59: return Command::ToggleHelp;      // F1
@@ -1270,6 +1524,29 @@ public:
             default: return Command::None;
             }
         }
+#else
+        if (key == 27) {
+            if (!hasKey()) {
+                return Command::Back;
+            }
+            const int next = readKey();
+            if (next != '[' && next != 'O') {
+                return Command::Back;
+            }
+            std::string sequence(1, static_cast<char>(next));
+            while (hasKey() && sequence.size() < 12) {
+                const int part = readKey();
+                if (part == 0) {
+                    break;
+                }
+                sequence.push_back(static_cast<char>(part));
+                if ((part >= 'A' && part <= 'Z') || part == '~') {
+                    break;
+                }
+            }
+            return commandFromEscape(sequence);
+        }
+#endif
 
         switch (key) {
         case 'q':
@@ -1316,6 +1593,58 @@ public:
         default: return Command::None;
         }
     }
+
+private:
+    static bool hasKey() {
+#ifdef _WIN32
+        return _kbhit() != 0;
+#else
+        timeval timeout{ 0, 0 };
+        fd_set set;
+        FD_ZERO(&set);
+        FD_SET(STDIN_FILENO, &set);
+        return select(STDIN_FILENO + 1, &set, nullptr, nullptr, &timeout) > 0;
+#endif
+    }
+
+    static int readKey() {
+#ifdef _WIN32
+        return _getch();
+#else
+        unsigned char c = 0;
+        return read(STDIN_FILENO, &c, 1) == 1 ? c : 0;
+#endif
+    }
+
+    static Command commandFromEscape(const std::string& sequence) {
+        if (sequence.empty()) {
+            return Command::None;
+        }
+
+        const char final = sequence.back();
+        switch (final) {
+        case 'A': return Command::MoveUp;
+        case 'B': return Command::MoveDown;
+        case 'C': return Command::ScrollPathRight;
+        case 'D': return Command::ScrollPathLeft;
+        case 'H': return Command::JumpTop;
+        case 'F': return Command::JumpBottom;
+        case 'P': return Command::ToggleHelp;
+        case '~':
+            if (sequence.find("[5") == 0) return Command::PageUp;
+            if (sequence.find("[6") == 0) return Command::PageDown;
+            if (sequence.find("[1") == 0 || sequence.find("[7") == 0) return Command::JumpTop;
+            if (sequence.find("[4") == 0 || sequence.find("[8") == 0) return Command::JumpBottom;
+            return Command::None;
+        default:
+            return Command::None;
+        }
+    }
+
+#ifndef _WIN32
+    termios originalTermios_{};
+    bool configured_ = false;
+#endif
 };
 
 class Renderer {
@@ -2796,6 +3125,7 @@ private:
         ui.pendingKillPid = 0;
         ui.killRequested.insert(pid);
 
+#ifdef _WIN32
         HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
         if (!process) {
             const std::string error = FormatLastError();
@@ -2813,6 +3143,16 @@ private:
             hub_.publish(EventType::KillFailed, pid, error);
         }
         CloseHandle(process);
+#else
+        if (::kill(static_cast<pid_t>(pid), SIGTERM) == 0) {
+            ui.notify(NotificationKind::Success, "SIGTERM sent to PID " + std::to_string(pid));
+            hub_.publish(EventType::ProcessKilled, pid, "SIGTERM requested");
+        } else {
+            const std::string error = FormatLastError(errno);
+            ui.notify(NotificationKind::Error, "kill failed: " + error, 40);
+            hub_.publish(EventType::KillFailed, pid, error);
+        }
+#endif
     }
 
     static void cancelKill(UiState& ui) {

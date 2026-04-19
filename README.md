@@ -1,8 +1,10 @@
 # CliProcster
 
-CliProcster is a Windows-first console/TUI process monitor. It is built as a lightweight WinAPI C++ app with keyboard navigation, process grouping, tree/subtree views, hunt alerts, rules, SIEM event export, and Prometheus textfile metrics.
+CliProcster is a cross-platform console/TUI process monitor. It uses WinAPI on Windows and `/proc` on Linux, with keyboard navigation, process grouping, tree/subtree views, hunt alerts, rules, SIEM event export, and Prometheus textfile metrics.
 
 ## Build
+
+### Windows
 
 Open a Developer PowerShell for Visual Studio, then run:
 
@@ -16,10 +18,33 @@ The binary is written to:
 x64\Debug\CliProcster.exe
 ```
 
+### Linux
+
+Install a C++17 compiler and CMake, then run:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+The binary is written to:
+
+```text
+build/CliProcster
+```
+
 ## Run
+
+Windows:
 
 ```powershell
 x64\Debug\CliProcster.exe
+```
+
+Linux:
+
+```bash
+./build/CliProcster
 ```
 
 Useful options:
@@ -34,6 +59,16 @@ x64\Debug\CliProcster.exe --prometheus-file cliprocster.prom
 x64\Debug\CliProcster.exe --export-json cliprocster_snapshot.json
 ```
 
+Linux uses the same flags:
+
+```bash
+./build/CliProcster --filter ssh
+./build/CliProcster --sort cpu
+./build/CliProcster --rules alert_rules.example.txt
+./build/CliProcster --siem-events cliprocster_events.ndjson
+./build/CliProcster --prometheus-file cliprocster.prom
+```
+
 ## Tabs
 
 Use the numeric tab keys:
@@ -44,7 +79,7 @@ Use the numeric tab keys:
 3  Kernel drivers
 ```
 
-The process tab is the main monitor. Registry and driver tabs are read-only trace views.
+The process tab is the main monitor. Registry and driver tabs are read-only trace views. On Linux, the registry tab explains that the Windows registry is not available, and the driver tab reads loaded modules from `/proc/modules`.
 
 ## Navigation
 
@@ -173,7 +208,7 @@ For a normal Prometheus scrape, use the textfile collector pattern or have a sma
 Main pieces in `main.cpp`:
 
 ```text
-ProcessCollector      WinAPI process/service/driver/registry collection
+ProcessCollector      WinAPI collection on Windows, /proc collection on Linux
 ProcessRepository     Snapshot cache and pause/live behavior
 UiState               Cursor, selection, tabs, panes, hunt state
 Renderer              Deterministic ANSI TUI rendering
@@ -195,6 +230,7 @@ Local HTTP API: /snapshot, /events, /metrics
 More rule fields: child count, signer, hash, command line
 Rule config format: TOML/JSON/YAML
 ETW-backed process start/stop tracing
+Linux proc connector/eBPF process start/stop tracing
 Driver signing metadata
 Registry diff history
 Service start/stop history
