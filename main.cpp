@@ -2655,7 +2655,7 @@ public:
 
         const ProcessInfo* selected = findSelectedProcess(byPid, ui);
 
-        WriteTerminal("\x1b[2J\x1b[?25l\x1b[H");
+        WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
         renderLeftPane(layout.leftWidth, layout.visibleRows, rows, byPid, ui);
         if (layout.twoPane) {
@@ -3193,7 +3193,7 @@ private:
             ui.scroll = ui.selectedIndex - layout.visibleRows + 1;
         }
 
-        WriteTerminal("\x1b[2J\x1b[?25l\x1b[H");
+        WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
         const std::string title = ui.activeTab == AppTab::Registry ? StartupAreaTitle() : "KERNEL DRIVERS";
         printBoxLine(4, 1, layout.width, title, Ansi::Cyan);
