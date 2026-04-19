@@ -2563,23 +2563,74 @@ private:
 #endif
 };
 
+std::string*& ActiveRenderBuffer() {
+    static thread_local std::string* buffer = nullptr;
+    return buffer;
+}
+
+void WriteTerminal(const std::string& text) {
+    if (ActiveRenderBuffer()) {
+        ActiveRenderBuffer()->append(text);
+        return;
+    }
+    std::cout << text;
+}
+
+std::unordered_map<std::string, std::string>& TerminalLineCache() {
+    static std::unordered_map<std::string, std::string> cache;
+    return cache;
+}
+
+void InvalidateTerminalCache() {
+    TerminalLineCache().clear();
+}
+
+class TerminalFrame {
+public:
+    TerminalFrame() : previous_(ActiveRenderBuffer()) {
+        ActiveRenderBuffer() = &buffer_;
+    }
+
+    ~TerminalFrame() {
+        flush();
+        ActiveRenderBuffer() = previous_;
+    }
+
+    void flush() {
+        if (flushed_) {
+            return;
+        }
+        std::cout << buffer_;
+        flushed_ = true;
+    }
+
+private:
+    std::string buffer_;
+    std::string* previous_ = nullptr;
+    bool flushed_ = false;
+};
+
 class Renderer {
 public:
     void render(const ProcessSnapshot& snapshot, const AppOptions& options, UiState& ui) const {
+        TerminalFrame frame;
         const Layout layout = makeLayout(ConsoleWindow::size(), options);
         if (ui.showHelp) {
             renderHelpScreen(layout.width, layout.height);
+            frame.flush();
             std::cout.flush();
             return;
         }
         if (layout.tooSmall) {
             renderTooSmall(layout);
+            frame.flush();
             std::cout.flush();
             return;
         }
 
         if (ui.activeTab != AppTab::Processes) {
             renderSystemTab(snapshot, options, ui, layout);
+            frame.flush();
             std::cout.flush();
             return;
         }
@@ -2604,15 +2655,17 @@ public:
 
         const ProcessInfo* selected = findSelectedProcess(byPid, ui);
 
-        std::cout << "\x1b[?25l\x1b[H";
+        WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
         renderLeftPane(layout.leftWidth, layout.visibleRows, rows, byPid, ui);
         if (layout.twoPane) {
             renderDivider(layout.leftWidth, layout.height);
             renderRightPane(layout.rightCol, layout.rightWidth, layout.height, snapshot, options, selected, ui);
+        } else if (layout.height > 2) {
+            printBoxLine(layout.height - 1, 1, layout.width, "");
         }
-        renderStatusBar(layout.height, layout.leftWidth, snapshot, rows, options, ui);
-        std::cout << "\x1b[J";
+        renderStatusBar(layout.height, layout.width, snapshot, rows, options, ui);
+        frame.flush();
         std::cout.flush();
     }
 
@@ -2946,11 +2999,38 @@ private:
         return fitLine(label + ": " + value, width);
     }
 
+    struct StyledLine {
+        std::string text;
+        const char* color = Ansi::Reset;
+    };
+
+    static void setStyledLine(std::vector<StyledLine>& lines, int firstRow, int row, std::string text, const char* color = Ansi::Reset) {
+        const int index = row - firstRow;
+        if (index < 0 || index >= static_cast<int>(lines.size())) {
+            return;
+        }
+        lines[static_cast<std::size_t>(index)] = { std::move(text), color };
+    }
+
+    static void flushStyledPane(int col, int width, int firstRow, const std::vector<StyledLine>& lines) {
+        for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+            const auto& line = lines[static_cast<std::size_t>(i)];
+            printBoxLine(firstRow + i, col, width, line.text, line.color);
+        }
+    }
+
     static void printAt(int row, int col, const std::string& text) {
         if (row <= 0 || col <= 0) {
             return;
         }
-        std::cout << "\x1b[" << row << ";" << col << "H" << text;
+        const std::string key = std::to_string(row) + ":" + std::to_string(col);
+        auto& cache = TerminalLineCache();
+        const auto cached = cache.find(key);
+        if (cached != cache.end() && cached->second == text) {
+            return;
+        }
+        cache[key] = text;
+        WriteTerminal("\x1b[" + std::to_string(row) + ";" + std::to_string(col) + "H" + text);
     }
 
     static void printBoxLine(int row, int col, int width, const std::string& text, const char* color = Ansi::Reset) {
@@ -2961,7 +3041,7 @@ private:
     }
 
     static void renderTooSmall(const Layout& layout) {
-        std::cout << "\x1b[?25l\x1b[H";
+        WriteTerminal("\x1b[?25l\x1b[H");
         for (int row = 1; row <= layout.height; ++row) {
             printBoxLine(row, 1, layout.width, "");
         }
@@ -2969,7 +3049,6 @@ private:
         printBoxLine(3, 1, layout.width, "Window is too small", Ansi::Orange);
         printBoxLine(4, 1, layout.width, "Resize to at least 52x12", Ansi::Dim);
         printBoxLine(6, 1, layout.width, "q quit | F1 help", Ansi::Dim);
-        std::cout << "\x1b[J";
     }
 
     static const char* notificationColor(NotificationKind kind) {
@@ -3114,7 +3193,7 @@ private:
             ui.scroll = ui.selectedIndex - layout.visibleRows + 1;
         }
 
-        std::cout << "\x1b[?25l\x1b[H";
+        WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
         const std::string title = ui.activeTab == AppTab::Registry ? StartupAreaTitle() : "KERNEL DRIVERS";
         printBoxLine(4, 1, layout.width, title, Ansi::Cyan);
@@ -3139,6 +3218,9 @@ private:
             const std::string line = entry.name + "  " + entry.detail;
             printBoxLine(row, 1, layout.width, line, cursor ? Ansi::FocusBg : (selected ? Ansi::Orange : Ansi::Reset));
         }
+        if (layout.height > 2) {
+            printBoxLine(layout.height - 1, 1, layout.width, "");
+        }
 
         std::ostringstream status;
         status << "tab " << TabName(ui.activeTab)
@@ -3146,7 +3228,6 @@ private:
                << " | Enter select row | d clear"
                << " | 1 processes | 2 " << StartupAreaName() << " | 3 drivers | / filter | " << (ui.message.text.empty() ? "ready" : ui.message.text);
         printBoxLine(layout.height, 1, layout.width, status.str(), ui.message.ttlFrames > 0 ? notificationColor(ui.message.kind) : Ansi::Dim);
-        std::cout << "\x1b[J";
     }
 
     static std::vector<ProcessGroup> buildGroups(const std::vector<ProcessInfo>& processes, const AppOptions& options) {
@@ -3238,32 +3319,34 @@ private:
         const UiState& ui
     ) {
         const auto& processes = snapshot.processes;
-        for (int row = 4; row <= height - 1; ++row) {
-            printBoxLine(row, col, width, "");
-        }
+        const int firstRow = 4;
+        const int lastRow = std::max(firstRow, height - 1);
+        const int footerStart = std::max(16, height - 4);
+        std::vector<StyledLine> pane(static_cast<std::size_t>(lastRow - firstRow + 1));
+        auto put = [&](int row, std::string text, const char* color = Ansi::Reset) {
+            setStyledLine(pane, firstRow, row, std::move(text), color);
+        };
 
-        printBoxLine(4, col, width, "SELECTED PROCESS", Ansi::Cyan);
+        put(4, "SELECTED PROCESS", Ansi::Cyan);
         if (selected) {
-            printBoxLine(5, col, width, field("pid", std::to_string(selected->pid), width));
-            printBoxLine(6, col, width, field("name", selected->name, width));
-            printBoxLine(7, col, width, field("sid", selected->sid.ok() ? selected->sid.value : selected->sid.status, width));
-            printBoxLine(8, col, width, field("svc", selected->service.empty() ? "<none>" : selected->service, width));
-            printBoxLine(9, col, width, field("path", selected->path.ok() ? selected->path.value : selected->path.status, width));
-            printBoxLine(10, col, width, field("cpu/mem", std::to_string(static_cast<int>(selected->cpu)) + "% / " + MemoryMb(selected->workingSet) + " MB", width));
+            put(5, field("pid", std::to_string(selected->pid), width));
+            put(6, field("name", selected->name, width));
+            put(7, field("sid", selected->sid.ok() ? selected->sid.value : selected->sid.status, width));
+            put(8, field("svc", selected->service.empty() ? "<none>" : selected->service, width));
+            put(9, field("path", selected->path.ok() ? selected->path.value : selected->path.status, width));
+            put(10, field("cpu/mem", std::to_string(static_cast<int>(selected->cpu)) + "% / " + MemoryMb(selected->workingSet) + " MB", width));
         } else {
-            printBoxLine(5, col, width, "<nothing selected>", Ansi::Dim);
-            for (int row = 6; row <= 10; ++row) {
-                printBoxLine(row, col, width, "");
-            }
+            put(5, "<nothing selected>", Ansi::Dim);
         }
 
-        printBoxLine(12, col, width, "RIGHT PANE [" + RightPaneModeName(ui.rightPaneMode) + "]  [ ] switch", Ansi::Cyan);
+        put(12, "RIGHT PANE [" + RightPaneModeName(ui.rightPaneMode) + "]  [ ] switch", Ansi::Cyan);
 
         if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
             const std::vector<SystemEntry> entries = ui.rightPaneMode == RightPaneMode::Services
                 ? FilterSystemEntries(snapshot.services, options)
                 : (ui.rightPaneMode == RightPaneMode::Drivers ? FilterSystemEntries(snapshot.drivers, options) : FilterSystemEntries(snapshot.registryKeys, options));
-            renderSystemEntries(col, width, height, entries, ui);
+            renderSystemEntries(pane, firstRow, footerStart, entries, ui);
+            flushStyledPane(col, width, firstRow, pane);
             return;
         }
 
@@ -3286,63 +3369,52 @@ private:
         if (ui.rightPaneMode == RightPaneMode::Details) {
             if (selected && ui.selectionActive) {
                 const int childCount = static_cast<int>(buildChildrenOfSelected(processes, options, selected->pid).size());
-                printBoxLine(13, col, width, "pid      " + std::to_string(selected->pid), Ansi::Orange);
-                printBoxLine(14, col, width, "ppid     " + std::to_string(selected->parentPid));
-                printBoxLine(15, col, width, "threads  " + std::to_string(selected->threads));
-                printBoxLine(16, col, width, "children " + std::to_string(childCount));
-                printBoxLine(17, col, width, "memory   " + MemoryMb(selected->workingSet) + " MB");
-                printBoxLine(18, col, width, "cpu      " + std::to_string(static_cast<int>(selected->cpu)) + "%");
-                printBoxLine(19, col, width, "service  " + (selected->service.empty() ? "<none>" : selected->service));
-                printBoxLine(20, col, width, "signer   " + selected->signer);
-                printBoxLine(21, col, width, "hash     " + selected->hash);
-                printBoxLine(22, col, width, "cmd      " + selected->commandLine);
-                printBoxLine(23, col, width, "path     " + selected->path.display());
-                int clearFrom = 24;
+                put(13, "pid      " + std::to_string(selected->pid), Ansi::Orange);
+                put(14, "ppid     " + std::to_string(selected->parentPid));
+                put(15, "threads  " + std::to_string(selected->threads));
+                put(16, "children " + std::to_string(childCount));
+                put(17, "memory   " + MemoryMb(selected->workingSet) + " MB");
+                put(18, "cpu      " + std::to_string(static_cast<int>(selected->cpu)) + "%");
+                put(19, "service  " + (selected->service.empty() ? "<none>" : selected->service));
+                put(20, "signer   " + selected->signer);
+                put(21, "hash     " + selected->hash);
+                put(22, "cmd      " + selected->commandLine);
+                put(23, "path     " + selected->path.display());
                 if (ui.hunt.active && ui.hunt.pid == selected->pid) {
                     std::ostringstream huntLine;
                     huntLine << "hunt     cpu " << std::fixed << std::setprecision(1) << ui.hunt.lastCpu
                              << "% peak " << ui.hunt.peakCpu
                              << "% mem " << MemoryMb(ui.hunt.lastWorkingSet)
                              << "/" << MemoryMb(ui.hunt.peakWorkingSet) << " MB";
-                    printBoxLine(24, col, width, huntLine.str(), ui.hunt.alert.empty() ? Ansi::Green : Ansi::Red);
-                    printBoxLine(25, col, width, "alert    " + (ui.hunt.alert.empty() ? std::string("none") : ui.hunt.alert), ui.hunt.alert.empty() ? Ansi::Dim : Ansi::Red);
-                    clearFrom = 26;
-                }
-                for (int row = clearFrom; row < height - 5; ++row) {
-                    printBoxLine(row, col, width, "");
+                    put(24, huntLine.str(), ui.hunt.alert.empty() ? Ansi::Green : Ansi::Red);
+                    put(25, "alert    " + (ui.hunt.alert.empty() ? std::string("none") : ui.hunt.alert), ui.hunt.alert.empty() ? Ansi::Dim : Ansi::Red);
                 }
             } else {
-                printBoxLine(13, col, width, "No process selected", Ansi::Orange);
-                printBoxLine(14, col, width, "Enter selects a row");
-                printBoxLine(15, col, width, "d or Esc clears selection");
-                for (int row = 16; row < height - 5; ++row) {
-                    printBoxLine(row, col, width, "");
-                }
+                put(13, "No process selected", Ansi::Orange);
+                put(14, "Enter selects a row");
+                put(15, "d or Esc clears selection");
             }
         } else if (selected && ui.rightPaneMode == RightPaneMode::Members && !items.empty()) {
             std::ostringstream summary;
             summary << selectedGroup.count << "x " << selectedGroup.name
                     << " | cpu " << std::fixed << std::setprecision(1) << selectedGroup.cpu
                     << " | mem " << MemoryMb(selectedGroup.workingSet) << " MB";
-            printBoxLine(14, col, width, summary.str(), Ansi::Orange);
+            put(14, summary.str(), Ansi::Orange);
         } else if (selected && ui.rightPaneMode == RightPaneMode::Children && !items.empty()) {
-            printBoxLine(14, col, width, std::to_string(items.size()) + " child process(es)", Ansi::Orange);
+            put(14, std::to_string(items.size()) + " child process(es)", Ansi::Orange);
         } else if (ui.rightPaneMode != RightPaneMode::Details) {
-            printBoxLine(14, col, width, selected ? "No visible " + RightPaneModeName(ui.rightPaneMode) : "No process selected", Ansi::Orange);
-            printBoxLine(15, col, width, selected ? "Filter may be hiding items" : "Select a process first", Ansi::Dim);
-            printBoxLine(16, col, width, selected ? "Try another mode with [ or ]" : "Enter selects the focused row", Ansi::Dim);
+            put(14, selected ? "No visible " + RightPaneModeName(ui.rightPaneMode) : "No process selected", Ansi::Orange);
+            put(15, selected ? "Filter may be hiding items" : "Select a process first", Ansi::Dim);
+            put(16, selected ? "Try another mode with [ or ]" : "Enter selects the focused row", Ansi::Dim);
         }
 
         if (ui.rightPaneMode != RightPaneMode::Details) {
-            printBoxLine(13, col, width, "pid    cpu  memMB    service/name");
-            const int maxMembers = std::max(0, height - 22);
+            put(13, "pid    cpu  memMB    service/name");
+            const int maxMembers = std::max(0, footerStart - 16);
             for (int i = 0; i < maxMembers; ++i) {
                 const int rowNo = 16 + i;
                 const int index = ui.rightScroll + i;
                 if (index >= static_cast<int>(items.size())) {
-                    if (rowNo > 16 || !items.empty()) {
-                        printBoxLine(rowNo, col, width, "");
-                    }
                     continue;
                 }
 
@@ -3357,23 +3429,27 @@ private:
                 const bool isRightCursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
                 const bool isSelectedMember = selected && item.pid == selected->pid;
                 const bool isHuntedMember = ui.hunt.active && item.pid == ui.hunt.pid;
-                printBoxLine(rowNo, col, width, row.str(), isRightCursor ? (isSelectedMember ? Ansi::OrangeBg : Ansi::FocusBg) : (isSelectedMember ? Ansi::Orange : (isHuntedMember ? Ansi::Green : Ansi::Reset)));
+                put(rowNo, row.str(), isRightCursor ? (isSelectedMember ? Ansi::OrangeBg : Ansi::FocusBg) : (isSelectedMember ? Ansi::Orange : (isHuntedMember ? Ansi::Green : Ansi::Reset)));
             }
         }
 
-        printBoxLine(height - 4, col, width, "MODE HINTS", Ansi::Cyan);
-        printBoxLine(height - 3, col, width, modeHints(options, ui), Ansi::Dim);
+        put(footerStart, "MODE HINTS", Ansi::Cyan);
+        put(footerStart + 1, modeHints(options, ui), Ansi::Dim);
         if (ui.hunt.active) {
             const char* huntColor = ui.hunt.alert.empty() ? Ansi::Green : Ansi::Red;
             const std::string state = ui.hunt.alert.empty() ? ui.hunt.status : ui.hunt.alert;
-            printBoxLine(height - 2, col, width, "hunt " + std::to_string(ui.hunt.pid) + " " + ui.hunt.name + ": " + state, huntColor);
+            put(footerStart + 2, "hunt " + std::to_string(ui.hunt.pid) + " " + ui.hunt.name + ": " + state, huntColor);
         } else {
-            printBoxLine(height - 2, col, width, "hunt: inactive", Ansi::Dim);
+            put(footerStart + 2, "hunt: inactive", Ansi::Dim);
         }
-        printBoxLine(height - 1, col, width, focusHint(ui), Ansi::Dim);
+        put(footerStart + 3, focusHint(ui), Ansi::Dim);
+        flushStyledPane(col, width, firstRow, pane);
     }
 
-    static void renderSystemEntries(int col, int width, int height, const std::vector<SystemEntry>& entries, const UiState& ui) {
+    static void renderSystemEntries(std::vector<StyledLine>& pane, int firstRow, int footerStart, const std::vector<SystemEntry>& entries, const UiState& ui) {
+        auto put = [&](int row, std::string text, const char* color = Ansi::Reset) {
+            setStyledLine(pane, firstRow, row, std::move(text), color);
+        };
         const RightPaneMode mode = ui.rightPaneMode;
         std::string heading;
         if (mode == RightPaneMode::Services) {
@@ -3384,13 +3460,12 @@ private:
             heading = StartupAreaColumnTitle();
         }
 
-        printBoxLine(13, col, width, heading, Ansi::Dim);
-        const int maxRows = std::max(0, height - 19);
+        put(13, heading, Ansi::Dim);
+        const int maxRows = std::max(0, footerStart - 15);
         for (int i = 0; i < maxRows; ++i) {
             const int row = 15 + i;
             const int index = ui.rightScroll + i;
             if (index >= static_cast<int>(entries.size())) {
-                printBoxLine(row, col, width, "");
                 continue;
             }
             const auto& entry = entries[static_cast<std::size_t>(index)];
@@ -3407,13 +3482,13 @@ private:
                 line << entry.name << " [" << entry.signer << "] => " << entry.detail;
             }
             const bool cursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
-            printBoxLine(row, col, width, line.str(), cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
+            put(row, line.str(), cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
         }
 
-        printBoxLine(height - 4, col, width, "TRACE SUMMARY", Ansi::Cyan);
-        printBoxLine(height - 3, col, width, std::to_string(entries.size()) + " " + RightPaneModeName(mode) + " entries", Ansi::Dim);
-        printBoxLine(height - 2, col, width, entries.empty() ? "no filtered entries" : "Enter follows PID when available", Ansi::Dim);
-        printBoxLine(height - 1, col, width, focusHint(ui), Ansi::Dim);
+        put(footerStart, "TRACE SUMMARY", Ansi::Cyan);
+        put(footerStart + 1, std::to_string(entries.size()) + " " + RightPaneModeName(mode) + " entries", Ansi::Dim);
+        put(footerStart + 2, entries.empty() ? "no filtered entries" : "Enter follows PID when available", Ansi::Dim);
+        put(footerStart + 3, focusHint(ui), Ansi::Dim);
     }
 
     static std::string focusHint(const UiState& ui) {
@@ -3491,7 +3566,7 @@ private:
     };
 
     static void renderHelpScreen(int width, int height) {
-        std::cout << "\x1b[?25l\x1b[H";
+        WriteTerminal("\x1b[?25l\x1b[H");
         for (int row = 1; row <= height; ++row) {
             printBoxLine(row, 1, width, "");
         }
@@ -3535,7 +3610,6 @@ private:
                 printBoxLine(height, 1, width, "make the console taller/wider for all shortcuts", Ansi::Orange);
             }
         }
-        std::cout << "\x1b[J";
     }
 
     static void printHelpRow(int row, int col, int width, const HelpRow& item) {
@@ -4204,6 +4278,7 @@ private:
 
     static void promptFilter(AppOptions& options, UiState& ui) {
         options.filter = ReadPromptLine("filter (name, pid, path, service, startup, driver; empty clears) > ");
+        InvalidateTerminalCache();
         ui.scroll = 0;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
@@ -4222,6 +4297,7 @@ private:
 
     static void promptSubtree(AppOptions& options, UiState& ui, const ProcessSnapshot& snapshot) {
         const std::string input = ReadPromptLine("subtree PID (0 clears) > ");
+        InvalidateTerminalCache();
 
         std::istringstream parser(input);
         DWORD pid = 0;
@@ -4372,6 +4448,7 @@ public:
         startApiIfConfigured();
 
         if (options_.once) {
+            InvalidateTerminalCache();
             std::cout << "\x1b[2J";
             repository_.refresh(options_, false);
             std::this_thread::sleep_for(std::chrono::milliseconds(std::max(100, options_.refreshMs)));
@@ -4403,12 +4480,14 @@ public:
             return 0;
         }
 
+        InvalidateTerminalCache();
         std::cout << "\x1b[?1049h\x1b[2J\x1b[H";
         ConsoleSize lastSize = ConsoleWindow::size();
         bool running = true;
         while (running) {
             const ConsoleSize currentSize = ConsoleWindow::size();
             if (currentSize != lastSize) {
+                InvalidateTerminalCache();
                 std::cout << "\x1b[2J\x1b[H";
                 lastSize = currentSize;
             }
@@ -4451,6 +4530,7 @@ public:
             }
         }
 
+        InvalidateTerminalCache();
         std::cout << "\x1b[2J\x1b[H\x1b[?25h\x1b[?1049l";
         return 0;
     }
