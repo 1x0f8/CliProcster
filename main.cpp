@@ -2958,8 +2958,12 @@ private:
               << " | " << (ui.paused ? "paused" : "live");
         printBoxLine(1, 1, width, title.str(), Ansi::Cyan);
         const std::string hints = width >= 112
-            ? "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | Tab pane | q quit"
-            : "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | q quit";
+            ? (ui.activeTab == AppTab::Processes
+                ? "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | Tab pane | q quit"
+                : "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | Enter select | d clear | q quit")
+            : (ui.activeTab == AppTab::Processes
+                ? "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | F1 help | PgUp/PgDn | q quit"
+                : "1 proc | 2 " + StartupAreaName() + " | 3 drivers | / filter | Enter select | q quit");
         printBoxLine(2, 1, width, hints, Ansi::Dim);
     }
 
@@ -3105,6 +3109,7 @@ private:
         std::ostringstream status;
         status << "tab " << TabName(ui.activeTab)
                << " | rows " << (entries.empty() ? 0 : ui.selectedIndex + 1) << "/" << entries.size()
+               << " | Enter select row | d clear"
                << " | 1 processes | 2 " << StartupAreaName() << " | 3 drivers | / filter | " << (ui.message.text.empty() ? "ready" : ui.message.text);
         printBoxLine(layout.height, 1, layout.width, status.str(), ui.message.ttlFrames > 0 ? notificationColor(ui.message.kind) : Ansi::Dim);
         std::cout << "\x1b[J";
@@ -3549,6 +3554,9 @@ public:
             ui.pathScroll += 4;
             break;
         case Command::FocusNextPane:
+            if (!requireProcessTab(ui, "right pane")) {
+                break;
+            }
             toggleFocusPane(ui, snapshot, options);
             break;
         case Command::ActivateSelection:
@@ -3565,15 +3573,27 @@ public:
             handleBack(ui);
             break;
         case Command::NextRightPaneMode:
+            if (!requireProcessTab(ui, "right pane modes")) {
+                break;
+            }
             cycleRightPaneMode(ui, true);
             break;
         case Command::PrevRightPaneMode:
+            if (!requireProcessTab(ui, "right pane modes")) {
+                break;
+            }
             cycleRightPaneMode(ui, false);
             break;
         case Command::HuntFocused:
+            if (!requireProcessTab(ui, "hunt")) {
+                break;
+            }
             huntFocused(ui, snapshot, options);
             break;
         case Command::SubtreeFocused:
+            if (!requireProcessTab(ui, "subtree")) {
+                break;
+            }
             subtreeFocused(ui, snapshot, options);
             break;
         case Command::ToggleHelp:
@@ -3624,9 +3644,15 @@ public:
             ui.notify(NotificationKind::Info, "filter/subtree cleared");
             break;
         case Command::PromptSubtree:
+            if (!requireProcessTab(ui, "subtree")) {
+                break;
+            }
             promptSubtree(options, ui, snapshot);
             break;
         case Command::RequestKill:
+            if (!requireProcessTab(ui, "kill")) {
+                break;
+            }
             requestKill(ui, snapshot);
             break;
         case Command::ConfirmYes:
@@ -3636,6 +3662,9 @@ public:
             cancelKill(ui);
             break;
         case Command::ToggleHunt:
+            if (!requireProcessTab(ui, "hunt")) {
+                break;
+            }
             toggleHunt(ui, snapshot, options);
             break;
         case Command::ShowProcessTab:
@@ -3706,6 +3735,14 @@ private:
         }
 
         ui.sortOrderPinned = true;
+    }
+
+    static bool requireProcessTab(UiState& ui, const std::string& action) {
+        if (ui.activeTab == AppTab::Processes) {
+            return true;
+        }
+        ui.notify(NotificationKind::Info, action + " works in the process tab; Enter selects " + TabName(ui.activeTab) + " rows");
+        return false;
     }
 
     int systemTabCount(const ProcessSnapshot& snapshot, const AppOptions& options, AppTab tab) const {
