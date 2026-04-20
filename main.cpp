@@ -3203,9 +3203,14 @@ private:
             printBoxLine(7, 3, layout.width - 4, options.filter.empty() ? "No entries visible or access denied." : "No entries match the filter.", Ansi::Orange);
         }
 
-        for (int i = 0; i < layout.visibleRows; ++i) {
-            const int index = ui.scroll + i;
-            const int row = 6 + i;
+        const int bodyLastRow = std::max(5, layout.height - 1);
+        for (int row = 6; row <= bodyLastRow; ++row) {
+            const int visibleOffset = row - 6;
+            if (visibleOffset >= layout.visibleRows) {
+                printBoxLine(row, 1, layout.width, "");
+                continue;
+            }
+            const int index = ui.scroll + visibleOffset;
             if (index >= static_cast<int>(entries.size())) {
                 printBoxLine(row, 1, layout.width, "");
                 continue;
@@ -3217,9 +3222,6 @@ private:
                 ui.selectedSystemKey == entry.type + ":" + entry.name;
             const std::string line = entry.name + "  " + entry.detail;
             printBoxLine(row, 1, layout.width, line, cursor ? Ansi::FocusBg : (selected ? Ansi::Orange : Ansi::Reset));
-        }
-        if (layout.height > 2) {
-            printBoxLine(layout.height - 1, 1, layout.width, "");
         }
 
         std::ostringstream status;
