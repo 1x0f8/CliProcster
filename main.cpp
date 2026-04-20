@@ -3521,7 +3521,9 @@ private:
 
     static void renderDivider(int leftWidth, int height) {
         for (int row = 3; row <= height; ++row) {
+            printBoxLine(row, leftWidth + 1, 1, "");
             printBoxLine(row, leftWidth + 2, 1, "|", Ansi::Dim);
+            printBoxLine(row, leftWidth + 3, 1, "");
         }
     }
 
