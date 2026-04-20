@@ -2645,7 +2645,7 @@ public:
         stabilizeSelection(ui, rows, layout.visibleRows);
         if (ui.selectionActive) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                const auto entries = rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                const auto entries = rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 clampRightList(ui, static_cast<int>(entries.size()), std::max(0, layout.height - 19));
             } else {
                 const auto rightItems = rightPaneItemsForActions(snapshot.processes, options, ui);
@@ -2700,9 +2700,18 @@ public:
         return {};
     }
 
-    std::vector<SystemEntry> rightSystemEntriesForActions(const ProcessSnapshot& snapshot, const AppOptions& options, RightPaneMode mode) const {
+    static std::vector<SystemEntry> rightSystemEntriesForActions(const ProcessSnapshot& snapshot, const AppOptions& options, RightPaneMode mode, DWORD selectedPid = 0) {
         if (mode == RightPaneMode::Services) {
-            return FilterSystemEntries(snapshot.services, options);
+            if (selectedPid == 0) {
+                return {};
+            }
+            std::vector<SystemEntry> services;
+            for (const auto& service : snapshot.services) {
+                if (service.pid == selectedPid) {
+                    services.push_back(service);
+                }
+            }
+            return FilterSystemEntries(services, options);
         }
         if (mode == RightPaneMode::Drivers) {
             return FilterSystemEntries(snapshot.drivers, options);
@@ -3345,7 +3354,7 @@ private:
 
         if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
             const std::vector<SystemEntry> entries = ui.rightPaneMode == RightPaneMode::Services
-                ? FilterSystemEntries(snapshot.services, options)
+                ? rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, selected ? selected->pid : 0)
                 : (ui.rightPaneMode == RightPaneMode::Drivers ? FilterSystemEntries(snapshot.drivers, options) : FilterSystemEntries(snapshot.registryKeys, options));
             renderSystemEntries(pane, firstRow, footerStart, entries, ui);
             flushStyledPane(col, width, firstRow, pane);
@@ -3463,6 +3472,9 @@ private:
         }
 
         put(13, heading, Ansi::Dim);
+        if (entries.empty()) {
+            put(15, mode == RightPaneMode::Services ? "no services bound to selected PID" : "no filtered entries", Ansi::Orange);
+        }
         const int maxRows = std::max(0, footerStart - 15);
         for (int i = 0; i < maxRows; ++i) {
             const int row = 15 + i;
@@ -3977,7 +3989,7 @@ private:
             return;
         }
         if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-            const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+            const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
             if (entries.empty()) {
                 ui.rightSelectedIndex = 0;
                 ui.rightScroll = 0;
@@ -4011,7 +4023,7 @@ private:
         }
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (entries.empty()) {
                     ui.rightSelectedIndex = 0;
                     ui.rightScroll = 0;
@@ -4092,7 +4104,7 @@ private:
     DWORD focusedPid(const UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
         if (ui.focusPane == FocusPane::GroupMembers && ui.rightPaneMode != RightPaneMode::Details) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (!entries.empty()) {
                     const int index = std::max(0, std::min(ui.rightSelectedIndex, static_cast<int>(entries.size()) - 1));
                     return entries[static_cast<std::size_t>(index)].pid;
@@ -4188,7 +4200,7 @@ private:
             if (ui.rightPaneMode != RightPaneMode::Details) {
                 const bool systemMode = ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry;
                 const bool hasItems = systemMode
-                    ? !renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode).empty()
+                    ? !renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid).empty()
                     : !renderer_.rightPaneItemsForActions(snapshot.processes, options, ui).empty();
                 if (!hasItems) {
                     ui.notify(NotificationKind::Warning, "right pane has no visible items");
@@ -4223,7 +4235,7 @@ private:
 
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode);
+                const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (entries.empty()) {
                     ui.notify(NotificationKind::Warning, "nothing in right pane to select");
                     return;
