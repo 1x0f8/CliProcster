@@ -316,6 +316,9 @@ struct UiState {
     int scroll = 0;
     int pathScroll = 0;
     int rightPathScroll = 0;
+    Command repeatCommand = Command::None;
+    int repeatCount = 0;
+    std::chrono::steady_clock::time_point repeatAt{};
     bool paused = false;
     bool showHelp = false;
     bool confirmKill = false;
@@ -3674,14 +3677,16 @@ public:
             return true;
         }
 
+        const int adaptiveStep = adaptiveNavigationStep(ui, command);
+
         switch (command) {
         case Command::Quit:
             return false;
         case Command::MoveUp:
-            moveSelection(ui, snapshot, options, -1);
+            moveSelection(ui, snapshot, options, -adaptiveStep);
             break;
         case Command::MoveDown:
-            moveSelection(ui, snapshot, options, 1);
+            moveSelection(ui, snapshot, options, adaptiveStep);
             break;
         case Command::PageUp:
             moveSelection(ui, snapshot, options, -renderer_.maxRows(options));
@@ -3697,16 +3702,16 @@ public:
             break;
         case Command::ScrollPathLeft:
             if (ui.focusPane == FocusPane::GroupMembers) {
-                ui.rightPathScroll = std::max(0, ui.rightPathScroll - 4);
+                ui.rightPathScroll = std::max(0, ui.rightPathScroll - adaptiveStep * 4);
             } else {
-                ui.pathScroll = std::max(0, ui.pathScroll - 4);
+                ui.pathScroll = std::max(0, ui.pathScroll - adaptiveStep * 4);
             }
             break;
         case Command::ScrollPathRight:
             if (ui.focusPane == FocusPane::GroupMembers) {
-                ui.rightPathScroll += 4;
+                ui.rightPathScroll += adaptiveStep * 4;
             } else {
-                ui.pathScroll += 4;
+                ui.pathScroll += adaptiveStep * 4;
             }
             break;
         case Command::FocusNextPane:
@@ -3855,6 +3860,35 @@ public:
     }
 
 private:
+    static int adaptiveNavigationStep(UiState& ui, Command command) {
+        const bool accelerates = command == Command::MoveUp ||
+            command == Command::MoveDown ||
+            command == Command::ScrollPathLeft ||
+            command == Command::ScrollPathRight;
+        const auto now = std::chrono::steady_clock::now();
+        if (!accelerates) {
+            ui.repeatCommand = Command::None;
+            ui.repeatCount = 0;
+            ui.repeatAt = now;
+            return 1;
+        }
+
+        const auto elapsed = now - ui.repeatAt;
+        if (ui.repeatCommand == command && elapsed <= std::chrono::milliseconds(260)) {
+            ui.repeatCount = std::min(ui.repeatCount + 1, 18);
+        } else {
+            ui.repeatCommand = command;
+            ui.repeatCount = 0;
+        }
+        ui.repeatAt = now;
+
+        if (ui.repeatCount >= 14) return 8;
+        if (ui.repeatCount >= 10) return 5;
+        if (ui.repeatCount >= 6) return 3;
+        if (ui.repeatCount >= 3) return 2;
+        return 1;
+    }
+
     static SortMode nextSortMode(SortMode current) {
         switch (current) {
         case SortMode::Cpu: return SortMode::Memory;
