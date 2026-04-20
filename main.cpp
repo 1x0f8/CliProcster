@@ -315,6 +315,7 @@ struct UiState {
     int rightScroll = 0;
     int scroll = 0;
     int pathScroll = 0;
+    int rightPathScroll = 0;
     bool paused = false;
     bool showHelp = false;
     bool confirmKill = false;
@@ -2657,6 +2658,7 @@ public:
 
         WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
+        printBoxLine(3, 1, layout.width, "");
         renderLeftPane(layout.leftWidth, layout.visibleRows, rows, byPid, ui);
         if (layout.twoPane) {
             renderDivider(layout.leftWidth, layout.height);
@@ -3008,6 +3010,22 @@ private:
         return fitLine(label + ": " + value, width);
     }
 
+    static std::string scrollingField(const std::string& label, const std::string& value, int width, int offset) {
+        const std::string prefix = label + " ";
+        const int valueWidth = std::max(1, width - static_cast<int>(prefix.size()));
+        const int safeOffset = std::max(0, offset);
+        std::string visible = SliceTo(value, static_cast<std::size_t>(safeOffset), static_cast<std::size_t>(valueWidth));
+        const bool hasMoreLeft = safeOffset > 0;
+        const bool hasMoreRight = value.size() > static_cast<std::size_t>(safeOffset + valueWidth);
+        if (!visible.empty() && hasMoreLeft) {
+            visible[0] = '<';
+        }
+        if (!visible.empty() && hasMoreRight) {
+            visible[visible.size() - 1] = '>';
+        }
+        return fitLine(prefix + visible, width);
+    }
+
     struct StyledLine {
         std::string text;
         const char* color = Ansi::Reset;
@@ -3204,6 +3222,7 @@ private:
 
         WriteTerminal("\x1b[?25l\x1b[H");
         renderHeader(layout.width, options, ui);
+        printBoxLine(3, 1, layout.width, "");
         const std::string title = ui.activeTab == AppTab::Registry ? StartupAreaTitle() : "KERNEL DRIVERS";
         printBoxLine(4, 1, layout.width, title, Ansi::Cyan);
         printBoxLine(5, 1, layout.width, ui.activeTab == AppTab::Registry ? StartupAreaColumnTitle() : "DRIVER / PATH", Ansi::Dim);
@@ -3389,8 +3408,8 @@ private:
                 put(19, "service  " + (selected->service.empty() ? "<none>" : selected->service));
                 put(20, "signer   " + selected->signer);
                 put(21, "hash     " + selected->hash);
-                put(22, "cmd      " + selected->commandLine);
-                put(23, "path     " + selected->path.display());
+                put(22, scrollingField("cmd     ", selected->commandLine, width, ui.rightPathScroll));
+                put(23, scrollingField("path    ", selected->path.display(), width, ui.rightPathScroll));
                 if (ui.hunt.active && ui.hunt.pid == selected->pid) {
                     std::ostringstream huntLine;
                     huntLine << "hunt     cpu " << std::fixed << std::setprecision(1) << ui.hunt.lastCpu
@@ -3563,11 +3582,12 @@ private:
         }
 
         std::ostringstream status;
+        const int activePathScroll = ui.focusPane == FocusPane::GroupMembers ? ui.rightPathScroll : ui.pathScroll;
         status << "rows " << (rows.empty() ? 0 : ui.selectedIndex + 1) << "/" << rows.size()
                << " | pids " << snapshot.processes.size()
                << " | focus " << (ui.focusPane == FocusPane::ProcessList ? "left" : "right")
                << " | selected " << (ui.selectionActive ? std::to_string(ui.selectedPid) : std::string("none"))
-               << " | path offset " << ui.pathScroll;
+               << " | path offset " << activePathScroll;
         if (ui.sortOrderPinned) {
             status << " | order pinned";
         }
@@ -3676,10 +3696,18 @@ public:
             jumpSelection(ui, snapshot, options, true);
             break;
         case Command::ScrollPathLeft:
-            ui.pathScroll = std::max(0, ui.pathScroll - 4);
+            if (ui.focusPane == FocusPane::GroupMembers) {
+                ui.rightPathScroll = std::max(0, ui.rightPathScroll - 4);
+            } else {
+                ui.pathScroll = std::max(0, ui.pathScroll - 4);
+            }
             break;
         case Command::ScrollPathRight:
-            ui.pathScroll += 4;
+            if (ui.focusPane == FocusPane::GroupMembers) {
+                ui.rightPathScroll += 4;
+            } else {
+                ui.pathScroll += 4;
+            }
             break;
         case Command::FocusNextPane:
             if (!requireProcessTab(ui, "right pane")) {
@@ -3757,6 +3785,7 @@ public:
             options.filter.clear();
             options.subtreePid = 0;
             ui.pathScroll = 0;
+            ui.rightPathScroll = 0;
             ui.rightSelectedIndex = 0;
             ui.rightScroll = 0;
             clearLiveSortHold(ui);
@@ -3916,6 +3945,7 @@ private:
         ui.activeTab = tab;
         ui.focusPane = FocusPane::ProcessList;
         ui.pathScroll = 0;
+        ui.rightPathScroll = 0;
         restoreTabCursor(ui);
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
@@ -3981,6 +4011,7 @@ private:
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
     }
 
     void moveRightSelection(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options, int delta) {
@@ -4098,6 +4129,7 @@ private:
         ui.rightPaneMode = nextRightPaneMode(ui.rightPaneMode, forward);
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
         ui.notify(NotificationKind::Info, "right pane: " + RightPaneModeName(ui.rightPaneMode));
     }
 
@@ -4178,6 +4210,7 @@ private:
                 ui.selectionActive = true;
                 ui.rightSelectedIndex = 0;
                 ui.rightScroll = 0;
+                ui.rightPathScroll = 0;
                 return;
             }
         }
@@ -4185,6 +4218,7 @@ private:
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
     }
 
     void toggleFocusPane(UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
@@ -4276,6 +4310,7 @@ private:
         ui.selectionActive = true;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
         ui.notify(NotificationKind::Success, "selected PID " + std::to_string(ui.selectedPid));
     }
 
@@ -4284,6 +4319,7 @@ private:
         ui.selectedPid = 0;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
         ui.focusPane = FocusPane::ProcessList;
         clearLiveSortHold(ui);
         ui.notify(NotificationKind::Info, "selection cleared");
@@ -4301,6 +4337,7 @@ private:
         ui.scroll = 0;
         ui.rightSelectedIndex = 0;
         ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
         clearLiveSortHold(ui);
         ui.notify(NotificationKind::Success, options.filter.empty() ? "filter cleared" : "filter applied: " + options.filter);
     }
