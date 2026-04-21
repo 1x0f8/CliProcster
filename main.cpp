@@ -2639,6 +2639,7 @@ public:
             return;
         }
 
+        normalizeRightPaneMode(ui);
         const auto byPid = indexByPid(snapshot.processes);
         auto rows = buildRows(snapshot.processes, options, ui);
         ensureBrowseOrderPinned(ui, rows, options);
@@ -2648,7 +2649,7 @@ public:
 
         stabilizeSelection(ui, rows, layout.visibleRows);
         if (ui.selectionActive) {
-            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+            if (ui.rightPaneMode == RightPaneMode::Services) {
                 const auto entries = rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 clampRightList(ui, static_cast<int>(entries.size()), std::max(0, layout.height - 19));
             } else {
@@ -2718,12 +2719,6 @@ public:
             }
             return FilterSystemEntries(services, options);
         }
-        if (mode == RightPaneMode::Drivers) {
-            return FilterSystemEntries(snapshot.drivers, options);
-        }
-        if (mode == RightPaneMode::Registry) {
-            return FilterSystemEntries(snapshot.registryKeys, options);
-        }
         return {};
     }
 
@@ -2732,6 +2727,23 @@ public:
     }
 
 private:
+    static bool isContextualRightPaneMode(RightPaneMode mode) {
+        return mode == RightPaneMode::Members ||
+            mode == RightPaneMode::Details ||
+            mode == RightPaneMode::Children ||
+            mode == RightPaneMode::Services;
+    }
+
+    static void normalizeRightPaneMode(UiState& ui) {
+        if (isContextualRightPaneMode(ui.rightPaneMode)) {
+            return;
+        }
+        ui.rightPaneMode = RightPaneMode::Details;
+        ui.rightSelectedIndex = 0;
+        ui.rightScroll = 0;
+        ui.rightPathScroll = 0;
+    }
+
     struct Layout {
         int width = 120;
         int height = 35;
@@ -3013,19 +3025,39 @@ private:
         return fitLine(label + ": " + value, width);
     }
 
-    static std::string scrollingField(const std::string& label, const std::string& value, int width, int offset) {
-        const std::string prefix = label + " ";
-        const int valueWidth = std::max(1, width - static_cast<int>(prefix.size()));
+    static std::string scrollingText(const std::string& value, int width, int offset) {
+        if (width <= 0) {
+            return {};
+        }
         const int safeOffset = std::max(0, offset);
-        std::string visible = SliceTo(value, static_cast<std::size_t>(safeOffset), static_cast<std::size_t>(valueWidth));
+        std::string visible = SliceTo(value, static_cast<std::size_t>(safeOffset), static_cast<std::size_t>(width));
         const bool hasMoreLeft = safeOffset > 0;
-        const bool hasMoreRight = value.size() > static_cast<std::size_t>(safeOffset + valueWidth);
+        const bool hasMoreRight = value.size() > static_cast<std::size_t>(safeOffset + width);
         if (!visible.empty() && hasMoreLeft) {
             visible[0] = '<';
         }
         if (!visible.empty() && hasMoreRight) {
             visible[visible.size() - 1] = '>';
         }
+        return visible;
+    }
+
+    static std::string scrollingLine(const std::string& value, int width, int offset) {
+        return fitLine(scrollingText(value, width, offset), width);
+    }
+
+    static std::string scrollingTail(const std::string& prefix, const std::string& value, int width, int offset) {
+        const int tailWidth = width - static_cast<int>(prefix.size());
+        if (tailWidth <= 4) {
+            return scrollingLine(prefix + value, width, offset);
+        }
+        return fitLine(prefix + scrollingText(value, tailWidth, offset), width);
+    }
+
+    static std::string scrollingField(const std::string& label, const std::string& value, int width, int offset) {
+        const std::string prefix = label + " ";
+        const int valueWidth = std::max(1, width - static_cast<int>(prefix.size()));
+        std::string visible = scrollingText(value, valueWidth, offset);
         return fitLine(prefix + visible, width);
     }
 
@@ -3374,11 +3406,9 @@ private:
 
         put(12, "RIGHT PANE [" + RightPaneModeName(ui.rightPaneMode) + "]  [ ] switch", Ansi::Cyan);
 
-        if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
-            const std::vector<SystemEntry> entries = ui.rightPaneMode == RightPaneMode::Services
-                ? rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, selected ? selected->pid : 0)
-                : (ui.rightPaneMode == RightPaneMode::Drivers ? FilterSystemEntries(snapshot.drivers, options) : FilterSystemEntries(snapshot.registryKeys, options));
-            renderSystemEntries(pane, firstRow, footerStart, entries, ui);
+        if (ui.rightPaneMode == RightPaneMode::Services) {
+            const std::vector<SystemEntry> entries = rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, selected ? selected->pid : 0);
+            renderSystemEntries(pane, firstRow, width, footerStart, entries, ui);
             flushStyledPane(col, width, firstRow, pane);
             return;
         }
@@ -3456,13 +3486,14 @@ private:
                 row << std::left
                     << std::setw(7) << item.pid
                     << std::setw(5) << static_cast<int>(item.cpu)
-                    << std::setw(9) << MemoryMb(item.workingSet)
-                    << (item.service.empty() ? item.name : item.service);
+                    << std::setw(9) << MemoryMb(item.workingSet);
+                const std::string prefix = row.str();
+                const std::string tail = item.service.empty() ? item.name : item.service;
 
                 const bool isRightCursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
                 const bool isSelectedMember = selected && item.pid == selected->pid;
                 const bool isHuntedMember = ui.hunt.active && item.pid == ui.hunt.pid;
-                put(rowNo, row.str(), isRightCursor ? (isSelectedMember ? Ansi::OrangeBg : Ansi::FocusBg) : (isSelectedMember ? Ansi::Orange : (isHuntedMember ? Ansi::Green : Ansi::Reset)));
+                put(rowNo, scrollingTail(prefix, tail, width, ui.rightPathScroll), isRightCursor ? (isSelectedMember ? Ansi::OrangeBg : Ansi::FocusBg) : (isSelectedMember ? Ansi::Orange : (isHuntedMember ? Ansi::Green : Ansi::Reset)));
             }
         }
 
@@ -3479,7 +3510,7 @@ private:
         flushStyledPane(col, width, firstRow, pane);
     }
 
-    static void renderSystemEntries(std::vector<StyledLine>& pane, int firstRow, int footerStart, const std::vector<SystemEntry>& entries, const UiState& ui) {
+    static void renderSystemEntries(std::vector<StyledLine>& pane, int firstRow, int width, int footerStart, const std::vector<SystemEntry>& entries, const UiState& ui) {
         auto put = [&](int row, std::string text, const char* color = Ansi::Reset) {
             setStyledLine(pane, firstRow, row, std::move(text), color);
         };
@@ -3505,20 +3536,26 @@ private:
                 continue;
             }
             const auto& entry = entries[static_cast<std::size_t>(index)];
-            std::ostringstream line;
+            std::string line;
             if (mode == RightPaneMode::Services) {
-                line << std::left << std::setw(15) << TrimTo(entry.name, 14)
-                     << std::setw(9) << entry.pid
-                     << entry.detail;
+                std::ostringstream row;
+                row << std::left << std::setw(15) << TrimTo(entry.name, 14)
+                    << std::setw(9) << entry.pid
+                    << entry.detail;
+                line = scrollingLine(row.str(), width, ui.rightPathScroll);
             } else if (mode == RightPaneMode::Drivers) {
-                line << std::left << std::setw(18) << TrimTo(entry.name, 17)
-                     << std::setw(12) << TrimTo(entry.signer, 11)
-                     << entry.detail;
+                const std::string name = TrimTo(entry.name, 17);
+                const std::string signer = TrimTo(entry.signer, 11);
+                std::ostringstream prefix;
+                prefix << std::left << std::setw(18) << name
+                       << std::setw(12) << signer;
+                line = scrollingTail(prefix.str(), entry.detail, width, ui.rightPathScroll);
             } else {
-                line << entry.name << " [" << entry.signer << "] => " << entry.detail;
+                const std::string fullLine = entry.name + "  " + entry.detail;
+                line = scrollingLine(fullLine, width, ui.rightPathScroll);
             }
             const bool cursor = ui.focusPane == FocusPane::GroupMembers && index == ui.rightSelectedIndex;
-            put(row, line.str(), cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
+            put(row, line, cursor ? Ansi::FocusBg : (mode == RightPaneMode::Drivers ? Ansi::Orange : Ansi::Reset));
         }
 
         put(footerStart, "TRACE SUMMARY", Ansi::Cyan);
@@ -3530,9 +3567,9 @@ private:
     static std::string focusHint(const UiState& ui) {
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Details) {
-                return "details active: [] modes, Esc back";
+                return "details active: Left/Right scroll | [] modes | Esc back";
             }
-            return "right active: Enter pick | x hunt | g subtree | Esc back";
+            return "right active: Enter pick | Left/Right scroll | PgUp/PgDn | Esc";
         }
         return "left active: Enter select | Tab right | Esc deselect";
     }
@@ -3540,9 +3577,9 @@ private:
     static std::string modeHints(const AppOptions& options, const UiState& ui) {
         if (ui.focusPane == FocusPane::GroupMembers) {
             if (ui.rightPaneMode == RightPaneMode::Details) {
-                return "details: [] pane mode | Esc back";
+                return "details: Left/Right scroll cmd/path | [] pane mode | Esc";
             }
-            return "right: Enter pick | x hunt | g subtree | PgUp/PgDn";
+            return "right: Left/Right scroll text | Enter pick | x hunt | PgUp/PgDn";
         }
         switch (options.viewMode) {
         case ViewMode::Tree:
@@ -3997,18 +4034,18 @@ private:
             case RightPaneMode::Members: return RightPaneMode::Details;
             case RightPaneMode::Details: return RightPaneMode::Children;
             case RightPaneMode::Children: return RightPaneMode::Services;
-            case RightPaneMode::Services: return RightPaneMode::Drivers;
-            case RightPaneMode::Drivers: return RightPaneMode::Registry;
+            case RightPaneMode::Services: return RightPaneMode::Members;
+            case RightPaneMode::Drivers: return RightPaneMode::Members;
             case RightPaneMode::Registry: return RightPaneMode::Members;
             }
         } else {
             switch (current) {
-            case RightPaneMode::Members: return RightPaneMode::Registry;
+            case RightPaneMode::Members: return RightPaneMode::Services;
             case RightPaneMode::Details: return RightPaneMode::Members;
             case RightPaneMode::Children: return RightPaneMode::Details;
             case RightPaneMode::Services: return RightPaneMode::Children;
             case RightPaneMode::Drivers: return RightPaneMode::Services;
-            case RightPaneMode::Registry: return RightPaneMode::Drivers;
+            case RightPaneMode::Registry: return RightPaneMode::Services;
             }
         }
         return RightPaneMode::Members;
@@ -4053,7 +4090,7 @@ private:
             ui.notify(NotificationKind::Warning, "select a process before using the right pane");
             return;
         }
-        if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+        if (ui.rightPaneMode == RightPaneMode::Services) {
             const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
             if (entries.empty()) {
                 ui.rightSelectedIndex = 0;
@@ -4087,7 +4124,7 @@ private:
             return;
         }
         if (ui.focusPane == FocusPane::GroupMembers) {
-            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+            if (ui.rightPaneMode == RightPaneMode::Services) {
                 const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (entries.empty()) {
                     ui.rightSelectedIndex = 0;
@@ -4169,7 +4206,7 @@ private:
 
     DWORD focusedPid(const UiState& ui, const ProcessSnapshot& snapshot, const AppOptions& options) {
         if (ui.focusPane == FocusPane::GroupMembers && ui.rightPaneMode != RightPaneMode::Details) {
-            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+            if (ui.rightPaneMode == RightPaneMode::Services) {
                 const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (!entries.empty()) {
                     const int index = std::max(0, std::min(ui.rightSelectedIndex, static_cast<int>(entries.size()) - 1));
@@ -4266,7 +4303,7 @@ private:
                 return;
             }
             if (ui.rightPaneMode != RightPaneMode::Details) {
-                const bool systemMode = ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry;
+                const bool systemMode = ui.rightPaneMode == RightPaneMode::Services;
                 const bool hasItems = systemMode
                     ? !renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid).empty()
                     : !renderer_.rightPaneItemsForActions(snapshot.processes, options, ui).empty();
@@ -4302,7 +4339,7 @@ private:
         }
 
         if (ui.focusPane == FocusPane::GroupMembers) {
-            if (ui.rightPaneMode == RightPaneMode::Services || ui.rightPaneMode == RightPaneMode::Drivers || ui.rightPaneMode == RightPaneMode::Registry) {
+            if (ui.rightPaneMode == RightPaneMode::Services) {
                 const auto entries = renderer_.rightSystemEntriesForActions(snapshot, options, ui.rightPaneMode, ui.selectedPid);
                 if (entries.empty()) {
                     ui.notify(NotificationKind::Warning, "nothing in right pane to select");
