@@ -23,7 +23,22 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\app.inc">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core_types.inc">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\integrations.inc">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="src\observability_backends.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\process_collectors.inc">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\tui.inc">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

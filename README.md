@@ -101,7 +101,9 @@ F1 or ?       help
 
 ## Stable CPU/Memory Browsing
 
-CPU and memory sorting are volatile because the ranking can change every refresh. CliProcster pins the visible order while browsing those sorts so the row under your cursor does not jump around.
+System CPU-share and memory sorting are volatile because the ranking can change every refresh. CliProcster pins the visible order while browsing those sorts so the row under your cursor does not jump around.
+
+CPU values are process share of total system CPU time, not per-core utilization. A fully busy single-threaded process on a many-core machine can therefore display well under 100%.
 
 The order remains pinned while you browse and filter. It is reset when you change sort, change view, switch away from the process tab, or deselect.
 
@@ -117,7 +119,7 @@ h  toggle hunt on selected process
 Current hunt signals:
 
 ```text
-CPU spike:       CPU >= 18%
+CPU spike:       system CPU share >= 18%
 Memory jump:     working set increases by >= 80 MB
 Missing target:  watched PID disappears
 Reacquire:       PID disappears but a process with the same name appears
@@ -141,6 +143,8 @@ alert_rules.example.json
 alert_rules.example.toml
 alert_rules.example.yaml
 ```
+
+The JSON/TOML/YAML loaders intentionally support the simple rule shapes shown in the example files. They are not full general-purpose parsers yet.
 
 Supported fields:
 
@@ -234,6 +238,10 @@ cliprocster_history_driver_events
 
 For a normal Prometheus scrape, use the textfile collector pattern or have a small local exporter serve this file.
 
+## Fingerprints and Signing
+
+The `hash` field is currently a fast path-and-size fingerprint, not a cryptographic content hash. The `signer` field reports `not-checked` until platform-specific signature verification is implemented.
+
 ## Architecture
 
 Main pieces:
@@ -259,12 +267,12 @@ SnapshotExporter      JSON snapshot export
 Planned natural extensions:
 
 ```text
-Local HTTP API: /snapshot, /events, /metrics
 More rule fields: child count, signer, hash, command line
 Rule config format: TOML/JSON/YAML
 ETW-backed process start/stop tracing
 Linux proc connector/eBPF process start/stop tracing
 Driver signing metadata
+Cryptographic SHA-256 file hashes
 Registry diff history
 Service start/stop history
 ```

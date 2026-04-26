@@ -140,7 +140,12 @@
     <ClCompile Include="src\observability_backends.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\app.inc" />
+    <ClInclude Include="src\core_types.inc" />
+    <ClInclude Include="src\integrations.inc" />
     <ClInclude Include="src\observability_backends.hpp" />
+    <ClInclude Include="src\process_collectors.inc" />
+    <ClInclude Include="src\tui.inc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

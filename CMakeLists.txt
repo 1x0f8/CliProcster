@@ -6,7 +6,7 @@ add_executable(CliProcster main.cpp src/observability_backends.cpp)
 target_compile_features(CliProcster PRIVATE cxx_std_17)
 
 if(WIN32)
-  target_link_libraries(CliProcster PRIVATE Ws2_32)
+  target_link_libraries(CliProcster PRIVATE Ws2_32 Psapi Advapi32)
 endif()
 
 if(MSVC)
